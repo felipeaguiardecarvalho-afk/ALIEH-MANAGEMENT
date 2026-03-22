@@ -1,3 +1,4 @@
 node_modules/
 .env
+.streamlit/secrets.toml
 __pycache__/

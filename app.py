@@ -18,15 +18,37 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "business.db"
-
-# Load .env from project root (folder containing app.py), then fill gaps from cwd .env if present.
 _env_path = BASE_DIR / ".env"
+
+# Local: load .env (cwd discovery + explicit project root next to app.py).
+load_dotenv()
 load_dotenv(_env_path, override=True)
 load_dotenv(override=False)
 
-# Supabase REST (PostgREST): use SUPABASE_URL and SUPABASE_ANON_KEY in .env (one line each; no line breaks).
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-SUPABASE_KEY = (os.getenv("SUPABASE_ANON_KEY") or "").strip()
+
+def _load_supabase_from_streamlit_secrets():
+    """Streamlit Cloud / .streamlit/secrets.toml: SUPABASE_URL and SUPABASE_ANON_KEY."""
+    try:
+        s = st.secrets
+        url = None
+        key = None
+        if hasattr(s, "get"):
+            url = s.get("SUPABASE_URL")
+            key = s.get("SUPABASE_ANON_KEY")
+        else:
+            if "SUPABASE_URL" in s:
+                url = s["SUPABASE_URL"]
+            if "SUPABASE_ANON_KEY" in s:
+                key = s["SUPABASE_ANON_KEY"]
+        return url, key
+    except Exception:
+        return None, None
+
+
+# Secrets first (Cloud), then process env from .env / OS.
+_sec_url, _sec_key = _load_supabase_from_streamlit_secrets()
+SUPABASE_URL = (_sec_url or os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_KEY = (_sec_key or os.getenv("SUPABASE_ANON_KEY") or "").strip()
 
 _logger = logging.getLogger(__name__)
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -2781,6 +2803,9 @@ def fetch_revenue_timeseries():
 
 def main():
     st.set_page_config(page_title="ALIEH Business Manager", layout="wide")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        st.error("Supabase environment variables not loaded")
+        st.stop()
     init_db()
 
     # Responsive app shell: flex row (sidebar + main). Collapsed sidebar → main uses full width.
@@ -2895,6 +2920,9 @@ def main():
 
     st.title("Business Management System")
     st.caption("Clean, simple products + sales + dashboard (SQLite-backed).")
+
+    st.sidebar.caption(f"Supabase URL loaded: {'YES' if SUPABASE_URL else 'NO'}")
+    st.sidebar.caption(f"Supabase KEY loaded: {'YES' if SUPABASE_KEY else 'NO'}")
 
     page = st.sidebar.radio(
         "Navigation",
@@ -3956,22 +3984,7 @@ def main():
             "**Save customer** inserts into **Supabase** `customers`. "
             "`customer_code` is generated in the database — do not enter it in the form."
         )
-        if not supabase_is_configured():
-            st.warning("Supabase environment variables not loaded")
-            # Temporary debug (no full key): confirm .env is read — project root = folder of app.py
-            _url_dbg = SUPABASE_URL or "(empty)"
-            _key_raw = os.getenv("SUPABASE_ANON_KEY") or ""
-            _key_dbg = (
-                f"{_key_raw[:10]}…"
-                if len(_key_raw) > 10
-                else (_key_raw if _key_raw else "(empty)")
-            )
-            st.caption(
-                f"Debug · `.env` path: `{_env_path}` · `SUPABASE_URL`: `{_url_dbg}` · "
-                f"`SUPABASE_ANON_KEY` (first 10 chars): `{_key_dbg}`"
-            )
-        else:
-            st.caption("New customers are saved only to **Supabase**.")
+        st.caption("New customers are saved only to **Supabase**.")
 
         tab_reg, tab_edit = st.tabs(["Register", "Edit customer"])
 
