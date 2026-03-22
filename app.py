@@ -2,7 +2,6 @@ import json
 import math
 import os
 import re
-import secrets
 import sqlite3
 import urllib.error
 import urllib.request
@@ -12,7 +11,6 @@ from typing import Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2640,63 +2638,8 @@ def fetch_revenue_timeseries():
     return df
 
 
-def _safe_str_eq(a: str, b: str) -> bool:
-    """Timing-safe string compare (UTF-8 bytes)."""
-    try:
-        return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
-def render_login_screen() -> None:
-    """Centered login form; sets ``st.session_state["auth_logged_in"]`` on success."""
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] { display: none !important; }
-        section.main .block-container {
-            max-width: 420px !important;
-            margin-left: auto !important;
-            margin-right: auto !important;
-            padding-top: 3rem !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.title("ALIEH Business Manager")
-    st.markdown("### Sign in")
-    st.caption("Enter your credentials to access the system.")
-    username = st.text_input("Username", key="login_username", autocomplete="username")
-    password = st.text_input(
-        "Password",
-        type="password",
-        key="login_password",
-        autocomplete="current-password",
-    )
-    if st.button("Login", type="primary", use_container_width=True):
-        env_user = (os.environ.get("SYSTEM_USERNAME") or "").strip()
-        env_pass = os.environ.get("SYSTEM_PASSWORD")
-        if not env_user or env_pass is None:
-            st.error("Invalid username or password")
-        elif _safe_str_eq(username.strip(), env_user) and _safe_str_eq(password, str(env_pass)):
-            st.session_state["auth_logged_in"] = True
-            st.rerun()
-        else:
-            st.error("Invalid username or password")
-
-
 def main():
     st.set_page_config(page_title="ALIEH Business Manager", layout="wide")
-    load_dotenv(BASE_DIR / ".env")
-
-    if "auth_logged_in" not in st.session_state:
-        st.session_state["auth_logged_in"] = False
-
-    if not st.session_state.get("auth_logged_in"):
-        render_login_screen()
-        st.stop()
-
     init_db()
 
     # Responsive app shell: flex row (sidebar + main). Collapsed sidebar → main uses full width.
@@ -2808,11 +2751,6 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-
-    st.sidebar.markdown("**Session**")
-    if st.sidebar.button("Logout", key="auth_logout_btn"):
-        st.session_state["auth_logged_in"] = False
-        st.rerun()
 
     st.title("Business Management System")
     st.caption("Clean, simple products + sales + dashboard (SQLite-backed).")
