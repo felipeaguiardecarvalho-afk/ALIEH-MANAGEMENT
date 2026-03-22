@@ -13,21 +13,20 @@ from typing import Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "business.db"
 
-try:
-    from dotenv import load_dotenv
+# Load .env from project root (folder containing app.py), then fill gaps from cwd .env if present.
+_env_path = BASE_DIR / ".env"
+load_dotenv(_env_path, override=True)
+load_dotenv(override=False)
 
-    load_dotenv(BASE_DIR / ".env")
-except ImportError:
-    pass
-
-# Supabase REST (PostgREST): one line per variable in .env; no line breaks inside values.
+# Supabase REST (PostgREST): use SUPABASE_URL and SUPABASE_ANON_KEY in .env (one line each; no line breaks).
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-SUPABASE_KEY = (os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or "").strip()
+SUPABASE_KEY = (os.getenv("SUPABASE_ANON_KEY") or "").strip()
 
 _logger = logging.getLogger(__name__)
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -3958,8 +3957,18 @@ def main():
             "`customer_code` is generated in the database — do not enter it in the form."
         )
         if not supabase_is_configured():
-            st.warning(
-                "Supabase is not configured. Set **SUPABASE_URL** and **SUPABASE_KEY** (or **SUPABASE_ANON_KEY**) in `.env`."
+            st.warning("Supabase environment variables not loaded")
+            # Temporary debug (no full key): confirm .env is read — project root = folder of app.py
+            _url_dbg = SUPABASE_URL or "(empty)"
+            _key_raw = os.getenv("SUPABASE_ANON_KEY") or ""
+            _key_dbg = (
+                f"{_key_raw[:10]}…"
+                if len(_key_raw) > 10
+                else (_key_raw if _key_raw else "(empty)")
+            )
+            st.caption(
+                f"Debug · `.env` path: `{_env_path}` · `SUPABASE_URL`: `{_url_dbg}` · "
+                f"`SUPABASE_ANON_KEY` (first 10 chars): `{_key_dbg}`"
             )
         else:
             st.caption("New customers are saved only to **Supabase**.")
