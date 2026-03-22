@@ -45,9 +45,24 @@ def _load_supabase_from_streamlit_secrets():
         return None, None
 
 
-# Secrets first (Cloud), then process env from .env / OS.
+def _normalize_supabase_url(raw: Optional[str]) -> str:
+    """Strip whitespace (including inside the string), optional quotes, and trailing slashes."""
+    if raw is None:
+        return ""
+    s = "".join(str(raw).split()).strip('"').strip("'")
+    return s.rstrip("/")
+
+
+def is_valid_supabase_url(url: str) -> bool:
+    """Require https and a non-empty host to avoid DNS errors on bad URLs."""
+    if not url.startswith("https://"):
+        return False
+    return bool(urllib.parse.urlparse(url).netloc)
+
+
+# Secrets first (Cloud), then .env / OS — same pattern as st.secrets.get → os.getenv fallback.
 _sec_url, _sec_key = _load_supabase_from_streamlit_secrets()
-SUPABASE_URL = (_sec_url or os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_URL = _normalize_supabase_url(_sec_url or os.getenv("SUPABASE_URL"))
 SUPABASE_KEY = (_sec_key or os.getenv("SUPABASE_ANON_KEY") or "").strip()
 
 _logger = logging.getLogger(__name__)
@@ -622,13 +637,17 @@ def fetch_customers_ordered() -> list:
 
 
 def supabase_is_configured() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+    return bool(
+        SUPABASE_KEY and SUPABASE_URL and is_valid_supabase_url(SUPABASE_URL)
+    )
 
 
 def require_supabase_env() -> None:
-    """Raise if Supabase URL/key are missing (no secrets logged)."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    """Raise if Supabase URL/key are missing or URL is invalid (no secrets logged)."""
+    if not SUPABASE_KEY:
         raise RuntimeError("Supabase environment variables not loaded")
+    if not SUPABASE_URL or not is_valid_supabase_url(SUPABASE_URL):
+        raise RuntimeError("Invalid Supabase URL (must be a full https:// URL with a host)")
 
 
 def insert_customer(customer: dict) -> list:
@@ -637,6 +656,7 @@ def insert_customer(customer: dict) -> list:
     Prefer: return=representation. Returns parsed JSON (inserted rows). No customer_code.
     """
     require_supabase_env()
+    st.write("DEBUG URL:", SUPABASE_URL)
     url = f"{SUPABASE_URL}/rest/v1/customers"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -653,6 +673,10 @@ def insert_customer(customer: dict) -> list:
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Supabase error ({e.code}): {err_body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Cannot reach Supabase at {SUPABASE_URL}. Check SUPABASE_URL and network/DNS. {e}"
+        ) from e
     if not raw:
         return []
     data = json.loads(raw.decode("utf-8"))
@@ -2803,8 +2827,11 @@ def fetch_revenue_timeseries():
 
 def main():
     st.set_page_config(page_title="ALIEH Business Manager", layout="wide")
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        st.error("Supabase environment variables not loaded")
+    if not SUPABASE_URL or not is_valid_supabase_url(SUPABASE_URL):
+        st.error(f"Invalid Supabase URL: {SUPABASE_URL}")
+        st.stop()
+    if not SUPABASE_KEY:
+        st.error("Supabase key not loaded")
         st.stop()
     init_db()
 
@@ -2921,8 +2948,8 @@ def main():
     st.title("Business Management System")
     st.caption("Clean, simple products + sales + dashboard (SQLite-backed).")
 
-    st.sidebar.caption(f"Supabase URL loaded: {'YES' if SUPABASE_URL else 'NO'}")
-    st.sidebar.caption(f"Supabase KEY loaded: {'YES' if SUPABASE_KEY else 'NO'}")
+    st.caption(f"Supabase URL loaded: {SUPABASE_URL}")
+    st.caption(f"Supabase KEY loaded: {'YES' if SUPABASE_KEY else 'NO'}")
 
     page = st.sidebar.radio(
         "Navigation",
