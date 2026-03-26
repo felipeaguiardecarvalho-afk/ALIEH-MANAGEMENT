@@ -6,8 +6,10 @@ import re
 import sqlite3
 
 
-def _sku_alphanumeric_clean(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", text or "").upper()
+def _sku_alphanumeric_clean(text: object) -> str:
+    # Session/widget state can occasionally be non-str; re.sub requires a string.
+    s = "" if text is None else str(text)
+    return re.sub(r"[^A-Za-z0-9]", "", s).upper()
 
 
 def sku_segment_two_chars(source: str) -> str:
@@ -19,8 +21,8 @@ def sku_segment_two_chars(source: str) -> str:
     return c[:2]
 
 
-def sku_color_segment_two_chars(color: str) -> str:
-    raw = (color or "").strip()
+def sku_color_segment_two_chars(color: object) -> str:
+    raw = ("" if color is None else str(color)).strip()
     parts = [p.strip() for p in raw.split("/")]
     parts = [p for p in parts if p]
     if len(parts) >= 2:
@@ -39,23 +41,23 @@ def format_sku_sequence_int(n: int) -> str:
 
 
 def build_product_sku_body(
-    product_name: str,
-    frame_color: str,
-    lens_color: str,
-    gender: str,
-    palette: str,
-    style: str,
+    product_name: object,
+    frame_color: object,
+    lens_color: object,
+    gender: object,
+    palette: object,
+    style: object,
 ) -> str:
     """
     Corpo do SKU (sem SEQ): [PP]-[FC]-[LC]-[GG]-[PA]-[ST].
     FC = cor da armação, LC = cor da lente (dois caracteres cada, mesmas regras de segmento).
     """
-    pp = sku_segment_two_chars(product_name or "")
-    fc = sku_color_segment_two_chars(frame_color or "")
-    lc = sku_color_segment_two_chars(lens_color or "")
-    gg = sku_segment_two_chars(gender or "")
-    pa = sku_segment_two_chars(palette or "")
-    seg_st = sku_segment_two_chars(style or "")
+    pp = sku_segment_two_chars("" if product_name is None else str(product_name))
+    fc = sku_color_segment_two_chars(frame_color)
+    lc = sku_color_segment_two_chars(lens_color)
+    gg = sku_segment_two_chars("" if gender is None else str(gender))
+    pa = sku_segment_two_chars("" if palette is None else str(palette))
+    seg_st = sku_segment_two_chars("" if style is None else str(style))
     return f"{pp}-{fc}-{lc}-{gg}-{pa}-{seg_st}"
 
 

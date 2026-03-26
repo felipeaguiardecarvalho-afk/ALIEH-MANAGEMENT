@@ -997,7 +997,14 @@ def _maybe_preview_product_sku() -> Optional[str]:
     s, es = resolve_attribute_value(st.session_state["prod_reg_style"], "", "o estilo")
     if efc or elc or ep or eg or es:
         return None
-    body = build_product_sku_body(name, fc, lc, g, p, s)
+    body = build_product_sku_body(
+        product_name=name,
+        frame_color=fc,
+        lens_color=lc,
+        gender=g,
+        palette=p,
+        style=s,
+    )
     return f"XXX-{body}"
 
 
