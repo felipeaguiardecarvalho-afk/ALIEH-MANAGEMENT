@@ -2,3 +2,6 @@ node_modules/
 .env
 .streamlit/secrets.toml
 __pycache__/
+*.db
+*.sqlite
+*.sqlite3

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from typing import Optional
 
 
 def _sku_alphanumeric_clean(text: object) -> str:
@@ -109,6 +110,48 @@ def build_product_sku_body(
     pa_seg = sku_segment_two_chars("" if pa is None else str(pa))
     st_seg = sku_segment_two_chars("" if seg_st is None else str(seg_st))
     return f"{pp}-{fc_seg}-{lc_seg}-{g_seg}-{pa_seg}-{st_seg}"
+
+
+def sku_base_body_after_seq(full_sku: object) -> str:
+    """Parte do SKU após o primeiro hífen (corpo sem o segmento SEQ), ou o texto todo se não houver hífen."""
+    s = ("" if full_sku is None else str(full_sku)).strip()
+    if not s or "-" not in s:
+        return s
+    return s.split("-", 1)[1]
+
+
+def sku_base_body_exists(
+    conn: sqlite3.Connection,
+    base_sku: str,
+    *,
+    exclude_product_id: Optional[int] = None,
+) -> bool:
+    """
+    True se já existe produto (não excluído) cujo SKU, ignorando só o primeiro segmento (SEQ),
+    coincide exatamente com ``base_sku``.
+    """
+    base_sku = (base_sku or "").strip()
+    if not base_sku:
+        return False
+    sql = """
+        SELECT 1 AS ok
+        FROM products
+        WHERE deleted_at IS NULL
+          AND sku IS NOT NULL AND TRIM(sku) != ''
+          AND (
+            CASE WHEN instr(TRIM(sku), '-') > 0
+              THEN substr(TRIM(sku), instr(TRIM(sku), '-') + 1)
+              ELSE TRIM(sku)
+            END
+          ) = ?
+    """
+    params: list = [base_sku]
+    if exclude_product_id is not None:
+        sql += " AND id != ?"
+        params.append(int(exclude_product_id))
+    sql += " LIMIT 1;"
+    row = conn.execute(sql, params).fetchone()
+    return row is not None
 
 
 def _next_sku_sequence(conn: sqlite3.Connection) -> int:

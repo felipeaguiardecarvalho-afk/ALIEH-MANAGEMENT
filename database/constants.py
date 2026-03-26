@@ -1,5 +1,8 @@
 """Constantes compartilhadas pelo banco e pelo app."""
 
+# Bloqueio de cadastro/edição quando já existe produto com o mesmo corpo de SKU (sem prefixo SEQ).
+DUPLICATE_SKU_BASE_ERROR_MSG = "Produto já cadastrado na base."
+
 # Composição de custo do SKU (rótulos exibidos; chave estável permanece em inglês)
 SKU_COST_COMPONENT_DEFINITIONS = [
     ("glasses", "Armação / lentes integradas"),

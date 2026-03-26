@@ -13,7 +13,10 @@ import pandas as pd
 import streamlit as st
 
 from database.connection import DB_PATH, get_conn
-from database.constants import SKU_COST_COMPONENT_DEFINITIONS
+from database.constants import (
+    DUPLICATE_SKU_BASE_ERROR_MSG,
+    SKU_COST_COMPONENT_DEFINITIONS,
+)
 from database.cost_components_repo import (
     ensure_sku_cost_component_rows,
     recompute_sku_structured_cost_total,
@@ -26,6 +29,7 @@ from database.sku_codec import (
     _next_sku_sequence,
     build_product_sku_body,
     format_sku_sequence_int,
+    sku_base_body_exists,
 )
 from database.sku_master_repo import ensure_sku_master, sync_sku_master_totals
 
@@ -1018,7 +1022,8 @@ def update_product_attributes(
 ) -> None:
     """
     Update attributes and recalculate SKU from product name + attributes.
-    Raises ValueError if another product already uses the new SKU.
+    Raises ValueError if another product already shares the same SKU base (body without SEQ),
+    or the same full SKU.
     """
     frame_color = (frame_color or "").strip()
     lens_color = (lens_color or "").strip()
@@ -1034,12 +1039,27 @@ def update_product_attributes(
             raise ValueError("Produto não encontrado.")
         name = str(row["name"] or "").strip()
         old_sku = str(row["sku"] or "").strip()
+        base_sku = build_product_sku_body(
+            name, frame_color, lens_color, gender, palette, style
+        )
+        if sku_base_body_exists(
+            conn,
+            base_sku,
+            exclude_product_id=product_id,
+        ):
+            raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
         oparts = old_sku.split("-")
         if oparts and oparts[0].isdigit():
-            new_sku = f"{oparts[0]}-{build_product_sku_body(name, frame_color, lens_color, gender, palette, style)}"
+            new_sku = f"{oparts[0]}-{base_sku}"
         else:
             new_sku = generate_product_sku(
-                name, frame_color, lens_color, gender, palette, style
+                name,
+                frame_color,
+                lens_color,
+                gender,
+                palette,
+                style,
+                exclude_product_id=product_id,
             )
         dup = conn.execute(
             """
@@ -1114,6 +1134,8 @@ def generate_product_sku(
     gender: str,
     palette: str,
     style: str,
+    *,
+    exclude_product_id: Optional[int] = None,
 ) -> str:
     """
     SKU completo: [SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]. SEQ = contador persistente (001+).
@@ -1122,10 +1144,16 @@ def generate_product_sku(
         conn.isolation_level = None
         conn.execute("BEGIN IMMEDIATE;")
         try:
-            n = _next_sku_sequence(conn)
             body = build_product_sku_body(
                 product_name, frame_color, lens_color, gender, palette, style
             )
+            if sku_base_body_exists(
+                conn,
+                body,
+                exclude_product_id=exclude_product_id,
+            ):
+                raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
+            n = _next_sku_sequence(conn)
             conn.execute("COMMIT;")
             return f"{format_sku_sequence_int(n)}-{body}"
         except Exception:
@@ -1398,6 +1426,9 @@ def add_product(
     Product registration typically uses stock=0; add stock via the Costing page (stock receipts).
     If stock > 0 here, unit_cost must be > 0 (weighted-average receipt).
 
+    Não insere novo lote se já existir lote com o mesmo nome + data + atributos, nem se já existir
+    o mesmo corpo de SKU (atributos), ignorando apenas o prefixo numérico SEQ.
+
     Returns the product enter code (slug + date). Raises ValueError or sqlite errors if not mergeable / DB fails.
     """
     product_enter_code = make_product_enter_code(product_name=name, registered_date=registered_date)
@@ -1443,29 +1474,15 @@ def add_product(
             ).fetchone()
 
             if existing is not None:
-                pid = int(existing["id"])
-                row_sku = conn.execute(
-                    "SELECT sku FROM products WHERE id = ?;",
-                    (pid,),
-                ).fetchone()
-                sku = str(row_sku["sku"] or "").strip()
-                conn.execute(
-                    """
-                    UPDATE products
-                    SET product_enter_code = COALESCE(product_enter_code, ?),
-                        sku = ?
-                    WHERE id = ?;
-                    """,
-                    (product_enter_code, sku, pid),
-                )
-                if float(stock) > 0:
-                    ensure_sku_master(conn, sku)
-                    apply_stock_receipt(conn, sku, pid, float(stock), float(unit_cost))
+                # Mesmo lote (nome + data + atributos): não re-cadastrar; evita "sucesso" sem linha nova.
+                raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
             else:
-                n = _next_sku_sequence(conn)
                 body = build_product_sku_body(
                     name, frame_color, lens_color, gender, palette, style
                 )
+                if sku_base_body_exists(conn, body):
+                    raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
+                n = _next_sku_sequence(conn)
                 sku = f"{format_sku_sequence_int(n)}-{body}"
                 clash = conn.execute(
                     "SELECT id FROM products WHERE sku = ?;",
@@ -2108,8 +2125,8 @@ def main():
         st.markdown("### Cadastro de produto")
         st.caption(
             "Cadastre apenas **novos lotes** (identidade + atributos). Exclusão de estoque é feita em **Estoque**. "
-            "Se cadastrar o mesmo **nome + data + cor da armação + cor da lente + estilo + paleta + gênero**, "
-            "o lote é **mesclado**. "
+            "Não é possível cadastrar de novo o mesmo **nome + data + atributos** nem um lote com o **mesmo SKU** "
+            "(corpo idêntico, ignorando o número sequencial do início). "
             "O **SKU** é gerado como `[SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]`. "
             "**Estoque** e **custo unitário** entram na página **Custos** (média ponderada por SKU)."
         )
@@ -2200,6 +2217,11 @@ def main():
                             gender=gender_val,
                             unit_cost=0.0,
                         )
+                    except ValueError as e:
+                        if str(e) == DUPLICATE_SKU_BASE_ERROR_MSG:
+                            st.error(DUPLICATE_SKU_BASE_ERROR_MSG)
+                        else:
+                            st.error(f"Não foi possível cadastrar o produto: {e}")
                     except Exception as e:
                         st.error(f"Não foi possível cadastrar o produto: {e}")
                     else:
