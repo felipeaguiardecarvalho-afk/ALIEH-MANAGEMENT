@@ -12,7 +12,7 @@ def _sku_alphanumeric_clean(text: object) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", s).upper()
 
 
-def sku_segment_two_chars(source: str) -> str:
+def sku_segment_two_chars(source: object) -> str:
     c = _sku_alphanumeric_clean(source)
     if len(c) == 0:
         return "XX"
@@ -42,23 +42,73 @@ def format_sku_sequence_int(n: int) -> str:
 
 def build_product_sku_body(
     product_name: object,
-    frame_color: object,
-    lens_color: object,
-    gender: object,
-    palette: object,
-    style: object,
+    *args: object,
+    frame_color: object = None,
+    lens_color: object = None,
+    gender: object = None,
+    palette: object = None,
+    style: object = None,
+    color: object = None,
 ) -> str:
     """
     Corpo do SKU (sem SEQ): [PP]-[FC]-[LC]-[GG]-[PA]-[ST].
-    FC = cor da armação, LC = cor da lente (dois caracteres cada, mesmas regras de segmento).
+
+    Formas suportadas:
+    - Nova: ``(nome, frame_color, lens_color, gender, palette, style)`` (5 valores após o nome);
+      ou só keywords ``frame_color=``, ``lens_color=``, etc.
+    - Legada: ``(nome, color, gender, palette, style)`` (4 valores após o nome);
+      ``color`` vira cor da armação; cor da lente fica ``Transparente``.
     """
+    fc = frame_color
+    lc = lens_color
+    gg = gender
+    pa = palette
+    seg_st = style
+
+    if color is not None and fc is None:
+        fc = color
+
+    n = len(args)
+    if n == 5:
+        if fc is None:
+            fc = args[0]
+        if lc is None:
+            lc = args[1]
+        if gg is None:
+            gg = args[2]
+        if pa is None:
+            pa = args[3]
+        if seg_st is None:
+            seg_st = args[4]
+    elif n == 4:
+        if fc is None:
+            fc = args[0]
+        if lc is None:
+            lc = "Transparente"
+        if gg is None:
+            gg = args[1]
+        if pa is None:
+            pa = args[2]
+        if seg_st is None:
+            seg_st = args[3]
+    elif n not in (0,):
+        raise TypeError(
+            "build_product_sku_body: após o nome use 5 valores "
+            "(cor armação, cor lente, gênero, paleta, estilo) ou 4 no formato legado "
+            "(cor, gênero, paleta, estilo). "
+            f"Recebidos {n} argumentos posicionais após o nome."
+        )
+
+    if lc is None:
+        lc = ""
+
     pp = sku_segment_two_chars("" if product_name is None else str(product_name))
-    fc = sku_color_segment_two_chars(frame_color)
-    lc = sku_color_segment_two_chars(lens_color)
-    gg = sku_segment_two_chars("" if gender is None else str(gender))
-    pa = sku_segment_two_chars("" if palette is None else str(palette))
-    seg_st = sku_segment_two_chars("" if style is None else str(style))
-    return f"{pp}-{fc}-{lc}-{gg}-{pa}-{seg_st}"
+    fc_seg = sku_color_segment_two_chars(fc)
+    lc_seg = sku_color_segment_two_chars(lc)
+    g_seg = sku_segment_two_chars("" if gg is None else str(gg))
+    pa_seg = sku_segment_two_chars("" if pa is None else str(pa))
+    st_seg = sku_segment_two_chars("" if seg_st is None else str(seg_st))
+    return f"{pp}-{fc_seg}-{lc_seg}-{g_seg}-{pa_seg}-{st_seg}"
 
 
 def _next_sku_sequence(conn: sqlite3.Connection) -> int:
