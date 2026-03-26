@@ -67,8 +67,8 @@ PRODUCT_STYLE_OPTIONS = [
     "Esportivo",
 ]
 
-# Cores padrão (nomes simples + variações comuns)
-PRODUCT_COLOR_OPTIONS = [
+# Cor da armação (cadastro)
+PRODUCT_FRAME_COLOR_OPTIONS = [
     "Preto",
     "Preto / Fosco",
     "Preto / Brilhante",
@@ -141,6 +141,24 @@ PRODUCT_COLOR_OPTIONS = [
     "Espelhado / Dourado",
     "Fosco",
     "Opaco",
+]
+
+# Cor da lente (óculos de sol)
+PRODUCT_LENS_COLOR_OPTIONS = [
+    "Preto",
+    "Cinza",
+    "Marrom",
+    "Verde",
+    "Azul",
+    "Degradê preto",
+    "Degradê marrom",
+    "Espelhado prata",
+    "Espelhado azul",
+    "Espelhado dourado",
+    "Espelhado verde",
+    "Amarelo",
+    "Transparente",
+    "Espelhado Rosa",
 ]
 
 # UX: placeholder do select; última opção é valor literal salvo no SKU quando usuário escolhe "Outro"
@@ -536,7 +554,7 @@ def fetch_product_batches_in_stock_for_sku(sku: str) -> list:
         return conn.execute(
             """
             SELECT p.id, p.name, p.stock, p.product_enter_code,
-                   p.color, p.style, p.palette, p.gender
+                   p.frame_color, p.lens_color, p.style, p.palette, p.gender
             FROM products p
             WHERE p.sku = ? AND p.deleted_at IS NULL
               AND COALESCE(p.stock, 0) > 0
@@ -930,7 +948,7 @@ def fetch_product_batches_for_sku(sku: str) -> list:
         return conn.execute(
             """
             SELECT id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked, stock,
-                   color, style, palette, gender
+                   frame_color, lens_color, style, palette, gender
             FROM products
             WHERE TRIM(COALESCE(sku, '')) = ?
               AND deleted_at IS NULL
@@ -959,22 +977,34 @@ def _maybe_preview_product_sku() -> Optional[str]:
     name = (st.session_state.get("prod_reg_name") or "").strip()
     if not name:
         return None
-    for k in ("prod_reg_color", "prod_reg_palette", "prod_reg_gender", "prod_reg_style"):
+    for k in (
+        "prod_reg_frame_color",
+        "prod_reg_lens_color",
+        "prod_reg_palette",
+        "prod_reg_gender",
+        "prod_reg_style",
+    ):
         if st.session_state.get(k) is None:
             return None
-    c, ec = resolve_attribute_value(st.session_state["prod_reg_color"], "", "a cor")
+    fc, efc = resolve_attribute_value(
+        st.session_state["prod_reg_frame_color"], "", "a cor da armação"
+    )
+    lc, elc = resolve_attribute_value(
+        st.session_state["prod_reg_lens_color"], "", "a cor da lente"
+    )
     p, ep = resolve_attribute_value(st.session_state["prod_reg_palette"], "", "a paleta")
     g, eg = resolve_attribute_value(st.session_state["prod_reg_gender"], "", "o gênero")
     s, es = resolve_attribute_value(st.session_state["prod_reg_style"], "", "o estilo")
-    if ec or ep or eg or es:
+    if efc or elc or ep or eg or es:
         return None
-    body = build_product_sku_body(name, c, g, p, s)
+    body = build_product_sku_body(name, fc, lc, g, p, s)
     return f"XXX-{body}"
 
 
 def update_product_attributes(
     product_id: int,
-    color: str,
+    frame_color: str,
+    lens_color: str,
     style: str,
     palette: str,
     gender: str,
@@ -983,7 +1013,8 @@ def update_product_attributes(
     Update attributes and recalculate SKU from product name + attributes.
     Raises ValueError if another product already uses the new SKU.
     """
-    color = (color or "").strip()
+    frame_color = (frame_color or "").strip()
+    lens_color = (lens_color or "").strip()
     style = (style or "").strip()
     palette = (palette or "").strip()
     gender = (gender or "").strip()
@@ -997,10 +1028,12 @@ def update_product_attributes(
         name = str(row["name"] or "").strip()
         old_sku = str(row["sku"] or "").strip()
         oparts = old_sku.split("-")
-        if len(oparts) >= 6 and oparts[0].isdigit():
-            new_sku = f"{oparts[0]}-{build_product_sku_body(name, color, gender, palette, style)}"
+        if oparts and oparts[0].isdigit():
+            new_sku = f"{oparts[0]}-{build_product_sku_body(name, frame_color, lens_color, gender, palette, style)}"
         else:
-            new_sku = generate_product_sku(name, color, gender, palette, style)
+            new_sku = generate_product_sku(
+                name, frame_color, lens_color, gender, palette, style
+            )
         dup = conn.execute(
             """
             SELECT id FROM products
@@ -1016,10 +1049,10 @@ def update_product_attributes(
         conn.execute(
             """
             UPDATE products
-            SET color = ?, style = ?, palette = ?, gender = ?, sku = ?
+            SET frame_color = ?, lens_color = ?, style = ?, palette = ?, gender = ?, sku = ?
             WHERE id = ?;
             """,
-            (color, style, palette, gender, new_sku, int(product_id)),
+            (frame_color, lens_color, style, palette, gender, new_sku, int(product_id)),
         )
 
 
@@ -1069,14 +1102,14 @@ def parse_cost_unit_price_value(value: float) -> tuple[float, Optional[str]]:
 
 def generate_product_sku(
     product_name: str,
-    color: str,
+    frame_color: str,
+    lens_color: str,
     gender: str,
     palette: str,
     style: str,
 ) -> str:
     """
-    Full SKU: [SEQ]-[PP]-[CC]-[GG]-[PA]-[ST]. SEQ is a persistent sequential code (001+).
-    Allocates the next sequence number atomically (BEGIN IMMEDIATE + counter update).
+    SKU completo: [SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]. SEQ = contador persistente (001+).
     """
     with get_conn() as conn:
         conn.isolation_level = None
@@ -1084,7 +1117,7 @@ def generate_product_sku(
         try:
             n = _next_sku_sequence(conn)
             body = build_product_sku_body(
-                product_name, color, gender, palette, style
+                product_name, frame_color, lens_color, gender, palette, style
             )
             conn.execute("COMMIT;")
             return f"{format_sku_sequence_int(n)}-{body}"
@@ -1196,7 +1229,7 @@ def fetch_products():
         rows = conn.execute(
             """
             SELECT id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked, stock,
-                   color, style, palette, gender
+                   frame_color, lens_color, style, palette, gender
             FROM products
             WHERE deleted_at IS NULL
             ORDER BY id DESC
@@ -1211,11 +1244,18 @@ def _sku_search_sanitize_text(q: str) -> str:
 
 
 def fetch_product_search_attribute_options() -> dict:
-    """Distinct color / gender / palette / style values for SKU search dropdowns."""
-    out: dict = {"color": [], "gender": [], "palette": [], "style": []}
+    """Valores distintos para filtros da busca por SKU."""
+    out: dict = {
+        "frame_color": [],
+        "lens_color": [],
+        "gender": [],
+        "palette": [],
+        "style": [],
+    }
     with get_conn() as conn:
         for key, col in [
-            ("color", "color"),
+            ("frame_color", "frame_color"),
+            ("lens_color", "lens_color"),
             ("gender", "gender"),
             ("palette", "palette"),
             ("style", "style"),
@@ -1235,7 +1275,8 @@ def fetch_product_search_attribute_options() -> dict:
 
 def search_products_filtered(
     text_q: str,
-    color_filter: str,
+    frame_color_filter: str,
+    lens_color_filter: str,
     gender_filter: str,
     palette_filter: str,
     style_filter: str,
@@ -1258,7 +1299,8 @@ def search_products_filtered(
         params.extend([pat, pat])
 
     for val, pcol in [
-        (color_filter, "p.color"),
+        (frame_color_filter, "p.frame_color"),
+        (lens_color_filter, "p.lens_color"),
         (gender_filter, "p.gender"),
         (palette_filter, "p.palette"),
         (style_filter, "p.style"),
@@ -1282,7 +1324,7 @@ def search_products_filtered(
     """
     count_sql = f"SELECT COUNT(*) AS cnt {base_from} WHERE {where_sql}"
     data_sql = f"""
-        SELECT p.id, p.sku, p.name, p.color, p.gender, p.palette, p.style,
+        SELECT p.id, p.sku, p.name, p.frame_color, p.lens_color, p.gender, p.palette, p.style,
                p.stock, p.created_at,
                COALESCE(sm.avg_unit_cost, p.cost, 0) AS avg_cost,
                COALESCE(sm.selling_price, p.price, 0) AS sell_price
@@ -1320,7 +1362,7 @@ def fetch_product_by_id(product_id: int):
     with get_conn() as conn:
         return conn.execute(
             """
-            SELECT p.id, p.sku, p.name, p.color, p.gender, p.palette, p.style,
+            SELECT p.id, p.sku, p.name, p.frame_color, p.lens_color, p.gender, p.palette, p.style,
                    p.stock, p.registered_date, p.product_enter_code, p.created_at,
                    COALESCE(sm.avg_unit_cost, p.cost, 0) AS avg_cost,
                    COALESCE(sm.selling_price, p.price, 0) AS sell_price
@@ -1336,14 +1378,15 @@ def add_product(
     name: str,
     stock: float,
     registered_date,
-    color: str,
+    frame_color: str,
+    lens_color: str,
     style: str,
     palette: str,
     gender: str,
     unit_cost: float,
 ) -> str:
     """
-    Register a product batch. SKU is [SEQ]-[PP]-[CC]-[GG]-[PA]-[ST] with a persistent sequence.
+    Registra um lote. SKU: [SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST].
 
     Product registration typically uses stock=0; add stock via the Costing page (stock receipts).
     If stock > 0 here, unit_cost must be > 0 (weighted-average receipt).
@@ -1352,7 +1395,8 @@ def add_product(
     """
     product_enter_code = make_product_enter_code(product_name=name, registered_date=registered_date)
     name = name.strip()
-    color = (color or "").strip()
+    frame_color = (frame_color or "").strip()
+    lens_color = (lens_color or "").strip()
     style = (style or "").strip()
     palette = (palette or "").strip()
     gender = (gender or "").strip()
@@ -1374,7 +1418,8 @@ def add_product(
                 SELECT id
                 FROM products
                 WHERE name = ? AND registered_date = ?
-                  AND COALESCE(color, '') = ?
+                  AND COALESCE(frame_color, '') = ?
+                  AND COALESCE(lens_color, '') = ?
                   AND COALESCE(style, '') = ?
                   AND COALESCE(palette, '') = ?
                   AND COALESCE(gender, '') = ?;
@@ -1382,7 +1427,8 @@ def add_product(
                 (
                     name,
                     registered_date_text,
-                    color,
+                    frame_color,
+                    lens_color,
                     style,
                     palette,
                     gender,
@@ -1410,7 +1456,9 @@ def add_product(
                     apply_stock_receipt(conn, sku, pid, float(stock), float(unit_cost))
             else:
                 n = _next_sku_sequence(conn)
-                body = build_product_sku_body(name, color, gender, palette, style)
+                body = build_product_sku_body(
+                    name, frame_color, lens_color, gender, palette, style
+                )
                 sku = f"{format_sku_sequence_int(n)}-{body}"
                 clash = conn.execute(
                     "SELECT id FROM products WHERE sku = ?;",
@@ -1426,16 +1474,17 @@ def add_product(
                     """
                     INSERT INTO products (
                         name, sku, registered_date, product_enter_code, cost, price, stock,
-                        color, style, palette, gender, created_at
+                        frame_color, lens_color, style, palette, gender, created_at
                     )
-                    VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         name,
                         sku,
                         registered_date_text,
                         product_enter_code,
-                        color,
+                        frame_color,
+                        lens_color,
                         style,
                         palette,
                         gender,
@@ -1920,26 +1969,32 @@ def main():
                     "Linhas por página", [25, 50, 100, 200], index=2, key="sku_search_ps"
                 )
 
-            fc1, fc2, fc3, fc4 = st.columns(4)
+            fc1, fc2, fc3, fc4, fc5 = st.columns(5)
             with fc1:
                 cf = st.selectbox(
-                    "Cor",
-                    [FILTER_ANY] + attr_opts["color"],
-                    key="sku_search_color",
+                    "Cor da armação",
+                    [FILTER_ANY] + attr_opts["frame_color"],
+                    key="sku_search_frame_color",
                 )
             with fc2:
+                lf = st.selectbox(
+                    "Cor da lente",
+                    [FILTER_ANY] + attr_opts["lens_color"],
+                    key="sku_search_lens_color",
+                )
+            with fc3:
                 gf = st.selectbox(
                     "Gênero",
                     [FILTER_ANY] + attr_opts["gender"],
                     key="sku_search_gender",
                 )
-            with fc3:
+            with fc4:
                 pf = st.selectbox(
                     "Paleta",
                     [FILTER_ANY] + attr_opts["palette"],
                     key="sku_search_palette",
                 )
-            with fc4:
+            with fc5:
                 sf = st.selectbox(
                     "Estilo",
                     [FILTER_ANY] + attr_opts["style"],
@@ -1947,7 +2002,7 @@ def main():
                 )
 
             _, total_match = search_products_filtered(
-                tq, cf, gf, pf, sf, sort_by, 1, 0
+                tq, cf, lf, gf, pf, sf, sort_by, 1, 0
             )
             total_pages = max(1, (total_match + page_size - 1) // page_size)
             if st.session_state.get("sku_search_page", 1) > total_pages:
@@ -1970,7 +2025,7 @@ def main():
                 )
 
             rows, _ = search_products_filtered(
-                tq, cf, gf, pf, sf, sort_by, page_size, (page_num - 1) * page_size
+                tq, cf, lf, gf, pf, sf, sort_by, page_size, (page_num - 1) * page_size
             )
 
             if not rows:
@@ -1982,7 +2037,8 @@ def main():
                             "ID": r["id"],
                             "SKU": r["sku"] or "—",
                             "Nome": r["name"] or "—",
-                            "Cor": r["color"] or "—",
+                            "Cor armação": r["frame_color"] or "—",
+                            "Cor lente": r["lens_color"] or "—",
                             "Gênero": r["gender"] or "—",
                             "Paleta": r["palette"] or "—",
                             "Estilo": r["style"] or "—",
@@ -2027,8 +2083,9 @@ def main():
                             st.markdown(
                                 f"- **SKU:** `{pr['sku'] or '—'}`\n"
                                 f"- **Nome:** {pr['name']}\n"
-                                f"- **Cor · Gênero · Paleta · Estilo:** "
-                                f"{pr['color'] or '—'} · {pr['gender'] or '—'} · "
+                                f"- **Cor armação · Cor lente · Gênero · Paleta · Estilo:** "
+                                f"{pr['frame_color'] or '—'} · {pr['lens_color'] or '—'} · "
+                                f"{pr['gender'] or '—'} · "
                                 f"{pr['palette'] or '—'} · {pr['style'] or '—'}\n"
                                 f"- **Estoque:** {format_qty_display_4(float(pr['stock'] or 0))}\n"
                                 f"- **Custo médio (SKU):** {format_money(float(pr['avg_cost'] or 0))}\n"
@@ -2044,8 +2101,9 @@ def main():
         st.markdown("### Cadastro de produto")
         st.caption(
             "Cadastre apenas **novos lotes** (identidade + atributos). Exclusão de estoque é feita em **Estoque**. "
-            "Se cadastrar o mesmo **nome + data + cor + estilo + paleta + gênero**, o lote é **mesclado**. "
-            "O **SKU** é gerado como `[SEQ]-[PP]-[CC]-[GG]-[PA]-[ST]`. "
+            "Se cadastrar o mesmo **nome + data + cor da armação + cor da lente + estilo + paleta + gênero**, "
+            "o lote é **mesclado**. "
+            "O **SKU** é gerado como `[SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]`. "
             "**Estoque** e **custo unitário** entram na página **Custos** (média ponderada por SKU)."
         )
         _prod_ok = st.session_state.pop("prod_reg_success_msg", None)
@@ -2066,9 +2124,12 @@ def main():
         )
         c1, c2 = st.columns(2)
         with c1:
-            color_opts = dropdown_with_other(PRODUCT_COLOR_OPTIONS)
-            color_choice = attribute_selectbox(
-                "Cor", color_opts, key="prod_reg_color", current_value=""
+            frame_opts = dropdown_with_other(PRODUCT_FRAME_COLOR_OPTIONS)
+            frame_color_choice = attribute_selectbox(
+                "Cor da armação",
+                frame_opts,
+                key="prod_reg_frame_color",
+                current_value="",
             )
 
             palette_opts = dropdown_with_other(PRODUCT_PALETTE_OPTIONS)
@@ -2076,15 +2137,23 @@ def main():
                 "Paleta", palette_opts, key="prod_reg_palette", current_value=""
             )
         with c2:
+            lens_opts = dropdown_with_other(PRODUCT_LENS_COLOR_OPTIONS)
+            lens_color_choice = attribute_selectbox(
+                "Cor da lente",
+                lens_opts,
+                key="prod_reg_lens_color",
+                current_value="",
+            )
+
             gender_opts = dropdown_with_other(PRODUCT_GENDER_OPTIONS)
             gender_choice = attribute_selectbox(
                 "Gênero", gender_opts, key="prod_reg_gender", current_value=""
             )
 
-            style_opts = dropdown_with_other(PRODUCT_STYLE_OPTIONS)
-            style_choice = attribute_selectbox(
-                "Estilo", style_opts, key="prod_reg_style", current_value=""
-            )
+        style_opts = dropdown_with_other(PRODUCT_STYLE_OPTIONS)
+        style_choice = attribute_selectbox(
+            "Estilo", style_opts, key="prod_reg_style", current_value=""
+        )
 
         preview_sku = _maybe_preview_product_sku()
         if preview_sku:
@@ -2098,11 +2167,16 @@ def main():
             if not name.strip():
                 st.error("O nome do produto é obrigatório.")
             else:
-                color_val, err_c = resolve_attribute_value(color_choice, "", "a cor")
+                frame_val, err_fc = resolve_attribute_value(
+                    frame_color_choice, "", "a cor da armação"
+                )
+                lens_val, err_lc = resolve_attribute_value(
+                    lens_color_choice, "", "a cor da lente"
+                )
                 palette_val, err_p = resolve_attribute_value(palette_choice, "", "a paleta")
                 gender_val, err_g = resolve_attribute_value(gender_choice, "", "o gênero")
                 style_val, err_s = resolve_attribute_value(style_choice, "", "o estilo")
-                field_errors = [e for e in (err_c, err_p, err_g, err_s) if e]
+                field_errors = [e for e in (err_fc, err_lc, err_p, err_g, err_s) if e]
                 if field_errors:
                     for e in field_errors:
                         st.error(e)
@@ -2112,7 +2186,8 @@ def main():
                             name=name,
                             stock=0,
                             registered_date=registered_date,
-                            color=color_val,
+                            frame_color=frame_val,
+                            lens_color=lens_val,
                             style=style_val,
                             palette=palette_val,
                             gender=gender_val,
@@ -2128,7 +2203,8 @@ def main():
                         for k in (
                             "prod_reg_name",
                             "prod_reg_date",
-                            "prod_reg_color",
+                            "prod_reg_frame_color",
+                            "prod_reg_lens_color",
                             "prod_reg_palette",
                             "prod_reg_gender",
                             "prod_reg_style",
@@ -2214,7 +2290,8 @@ def main():
                         attrs = " · ".join(
                             x
                             for x in (
-                                batch_row["color"],
+                                batch_row["frame_color"],
+                                batch_row["lens_color"],
                                 batch_row["style"],
                                 batch_row["palette"],
                                 batch_row["gender"],
@@ -2674,7 +2751,8 @@ def main():
                     attrs = " · ".join(
                         x
                         for x in (
-                            p["color"] or "",
+                            p["frame_color"] or "",
+                            p["lens_color"] or "",
                             p["style"] or "",
                             p["palette"] or "",
                             p["gender"] or "",
@@ -3556,7 +3634,8 @@ def main():
             sku = r["sku"] or ""
             reg_date = r["registered_date"] or ""
             name = str(r["name"])
-            color = r["color"] or ""
+            frame_color = r["frame_color"] or ""
+            lens_color = r["lens_color"] or ""
             style = r["style"] or ""
             palette = r["palette"] or ""
             gender = r["gender"] or ""
@@ -3572,7 +3651,8 @@ def main():
                     "name": name,
                     "sku": sku,
                     "registered_date": reg_date,
-                    "color": color,
+                    "frame_color": frame_color,
+                    "lens_color": lens_color,
                     "style": style,
                     "palette": palette,
                     "gender": gender,
@@ -3585,17 +3665,18 @@ def main():
 
         # Column layout: tight weights; Streamlit columns share full width proportionally.
         stock_col_w = [
-            0.88,
-            1.52,
-            0.92,
-            0.92,
-            0.92,
-            1.0,
-            0.88,
-            0.9,
-            0.9,
-            0.9,
-            0.86,
+            0.82,
+            1.38,
+            0.85,
+            0.78,
+            0.78,
+            0.78,
+            0.82,
+            0.78,
+            0.84,
+            0.84,
+            0.84,
+            0.78,
         ]
 
         # Build header filters (Excel-like column dropdowns).
@@ -3620,72 +3701,85 @@ def main():
             key="stock_filter_sku",
         )
 
-        header[3].markdown("**Cor**")
-        color_options = sorted({it["color"] for it in items if it["color"] is not None})
-        selected_colors = header[3].multiselect(
+        header[3].markdown("**Cor armação**")
+        frame_color_options = sorted(
+            {it["frame_color"] for it in items if it["frame_color"] is not None}
+        )
+        selected_frame_colors = header[3].multiselect(
             label="",
-            options=color_options,
+            options=frame_color_options,
             default=[],
-            key="stock_filter_color",
+            key="stock_filter_frame_color",
         )
 
-        header[4].markdown("**Estilo**")
+        header[4].markdown("**Cor lente**")
+        lens_color_options = sorted(
+            {it["lens_color"] for it in items if it["lens_color"] is not None}
+        )
+        selected_lens_colors = header[4].multiselect(
+            label="",
+            options=lens_color_options,
+            default=[],
+            key="stock_filter_lens_color",
+        )
+
+        header[5].markdown("**Estilo**")
         style_options = sorted({it["style"] for it in items if it["style"] is not None})
-        selected_styles = header[4].multiselect(
+        selected_styles = header[5].multiselect(
             label="",
             options=style_options,
             default=[],
             key="stock_filter_style",
         )
 
-        header[5].markdown("**Paleta**")
+        header[6].markdown("**Paleta**")
         palette_options = sorted({it["palette"] for it in items if it["palette"] is not None})
-        selected_palettes = header[5].multiselect(
+        selected_palettes = header[6].multiselect(
             label="",
             options=palette_options,
             default=[],
             key="stock_filter_palette",
         )
 
-        header[6].markdown("**Gênero**")
+        header[7].markdown("**Gênero**")
         gender_options = sorted({it["gender"] for it in items if it["gender"] is not None})
-        selected_genders = header[6].multiselect(
+        selected_genders = header[7].multiselect(
             label="",
             options=gender_options,
             default=[],
             key="stock_filter_gender",
         )
 
-        header[7].markdown("**Custo**")
+        header[8].markdown("**Custo**")
         cost_options = sorted({it["cost"] for it in items})
-        selected_costs = header[7].multiselect(
+        selected_costs = header[8].multiselect(
             label="",
             options=cost_options,
             default=[],
             key="stock_filter_cost",
         )
 
-        header[8].markdown("**Preço de venda**")
+        header[9].markdown("**Preço de venda**")
         price_options = sorted({it["price"] for it in items})
-        selected_prices = header[8].multiselect(
+        selected_prices = header[9].multiselect(
             label="",
             options=price_options,
             default=[],
             key="stock_filter_price",
         )
 
-        header[9].markdown("**Margem**")
+        header[10].markdown("**Margem**")
         markup_options = sorted({it["markup"] for it in items})
-        selected_markups = header[9].multiselect(
+        selected_markups = header[10].multiselect(
             label="",
             options=markup_options,
             default=[],
             key="stock_filter_markup",
         )
 
-        header[10].markdown("**Em estoque**")
+        header[11].markdown("**Em estoque**")
         stock_options = sorted({it["stock_qty"] for it in items})
-        selected_stocks = header[10].multiselect(
+        selected_stocks = header[11].multiselect(
             label="",
             options=stock_options,
             default=[],
@@ -3699,7 +3793,9 @@ def main():
                 continue
             if selected_skus and it["sku"] not in selected_skus:
                 continue
-            if selected_colors and it["color"] not in selected_colors:
+            if selected_frame_colors and it["frame_color"] not in selected_frame_colors:
+                continue
+            if selected_lens_colors and it["lens_color"] not in selected_lens_colors:
                 continue
             if selected_styles and it["style"] not in selected_styles:
                 continue
@@ -3753,7 +3849,8 @@ def main():
                     attr_bits = " · ".join(
                         x
                         for x in (
-                            it["color"],
+                            it["frame_color"],
+                            it["lens_color"],
                             it["style"],
                             it["palette"],
                             it["gender"],
@@ -3768,14 +3865,15 @@ def main():
 
             row[1].markdown(f"**{name}**")
             row[2].write(sku or "—")
-            row[3].write(it["color"] or "—")
-            row[4].write(it["style"] or "—")
-            row[5].write(it["palette"] or "—")
-            row[6].write(it["gender"] or "—")
-            row[7].write(format_money(cost))
-            row[8].write(format_money(price))
-            row[9].write(format_money(markup_amount))
-            row[10].write(stock_qty)
+            row[3].write(it["frame_color"] or "—")
+            row[4].write(it["lens_color"] or "—")
+            row[5].write(it["style"] or "—")
+            row[6].write(it["palette"] or "—")
+            row[7].write(it["gender"] or "—")
+            row[8].write(format_money(cost))
+            row[9].write(format_money(price))
+            row[10].write(format_money(markup_amount))
+            row[11].write(stock_qty)
 
             totals_cost += cost * stock_qty
             totals_price += price * stock_qty
@@ -3787,12 +3885,12 @@ def main():
         with total_row[0]:
             st.write("")
         total_row[1].markdown("**TOTAL GERAL**")
-        for _i in range(2, 7):
+        for _i in range(2, 8):
             total_row[_i].write("")
-        total_row[7].write(format_money(totals_cost))
-        total_row[8].write(format_money(totals_price))
-        total_row[9].write(format_money(totals_markup))
-        total_row[10].write(totals_stock)
+        total_row[8].write(format_money(totals_cost))
+        total_row[9].write(format_money(totals_price))
+        total_row[10].write(format_money(totals_markup))
+        total_row[11].write(totals_stock)
 
 
 if __name__ == "__main__":

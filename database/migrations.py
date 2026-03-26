@@ -20,7 +20,7 @@ from database.sku_master_repo import sync_sku_master_totals
 def migrate_product_skus_to_generated(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        SELECT id, name, color, gender, palette, style, sku
+        SELECT id, name, frame_color, lens_color, gender, palette, style, sku
         FROM products
         ORDER BY id;
         """
@@ -28,14 +28,15 @@ def migrate_product_skus_to_generated(conn: sqlite3.Connection) -> None:
     for row in rows:
         body = build_product_sku_body(
             str(row["name"] or ""),
-            row["color"] or "",
+            row["frame_color"] or "",
+            row["lens_color"] or "",
             row["gender"] or "",
             row["palette"] or "",
             row["style"] or "",
         )
         old_sku = str(row["sku"] or "").strip()
         oparts = old_sku.split("-")
-        if len(oparts) >= 6 and oparts[0].isdigit():
+        if oparts and oparts[0].isdigit():
             new_sku = f"{oparts[0]}-{body}"
         else:
             n = _next_sku_sequence(conn)
@@ -165,7 +166,8 @@ def migrate_inventory_decimal_v1(conn: sqlite3.Connection) -> None:
             price REAL NOT NULL,
             pricing_locked INTEGER NOT NULL DEFAULT 0 CHECK(pricing_locked IN (0, 1)),
             stock REAL NOT NULL CHECK(stock >= 0),
-            color TEXT,
+            frame_color TEXT,
+            lens_color TEXT,
             style TEXT,
             palette TEXT,
             gender TEXT
@@ -176,11 +178,14 @@ def migrate_inventory_decimal_v1(conn: sqlite3.Connection) -> None:
         """
         INSERT INTO products_new (
             id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked,
-            stock, color, style, palette, gender
+            stock, frame_color, lens_color, style, palette, gender
         )
         SELECT
             id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked,
-            CAST(stock AS REAL), color, style, palette, gender
+            CAST(stock AS REAL),
+            color,
+            '',
+            style, palette, gender
         FROM products;
         """
     )

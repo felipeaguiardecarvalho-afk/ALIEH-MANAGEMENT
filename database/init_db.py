@@ -37,7 +37,8 @@ def init_db() -> None:
                 price REAL NOT NULL,
                 pricing_locked INTEGER NOT NULL DEFAULT 0 CHECK(pricing_locked IN (0, 1)),
                 stock REAL NOT NULL CHECK(stock >= 0),
-                color TEXT,
+                frame_color TEXT,
+                lens_color TEXT,
                 style TEXT,
                 palette TEXT,
                 gender TEXT
@@ -318,14 +319,28 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE products ADD COLUMN pricing_locked INTEGER NOT NULL DEFAULT 0 CHECK(pricing_locked IN (0, 1));"
             )
-        if "color" not in product_cols:
-            conn.execute("ALTER TABLE products ADD COLUMN color TEXT;")
+        if "color" in product_cols and "frame_color" not in product_cols:
+            conn.execute("ALTER TABLE products RENAME COLUMN color TO frame_color;")
+        product_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(products);").fetchall()
+        }
+        if "frame_color" not in product_cols:
+            conn.execute("ALTER TABLE products ADD COLUMN frame_color TEXT;")
+        if "lens_color" not in product_cols:
+            conn.execute("ALTER TABLE products ADD COLUMN lens_color TEXT;")
         if "style" not in product_cols:
             conn.execute("ALTER TABLE products ADD COLUMN style TEXT;")
         if "palette" not in product_cols:
             conn.execute("ALTER TABLE products ADD COLUMN palette TEXT;")
         if "gender" not in product_cols:
             conn.execute("ALTER TABLE products ADD COLUMN gender TEXT;")
+        conn.execute(
+            """
+            UPDATE products
+            SET lens_color = 'Transparente'
+            WHERE lens_color IS NULL OR TRIM(COALESCE(lens_color, '')) = '';
+            """
+        )
 
         missing_rows = conn.execute(
             """

@@ -40,17 +40,23 @@ def format_sku_sequence_int(n: int) -> str:
 
 def build_product_sku_body(
     product_name: str,
-    color: str,
+    frame_color: str,
+    lens_color: str,
     gender: str,
     palette: str,
     style: str,
 ) -> str:
+    """
+    Corpo do SKU (sem SEQ): [PP]-[FC]-[LC]-[GG]-[PA]-[ST].
+    FC = cor da armação, LC = cor da lente (dois caracteres cada, mesmas regras de segmento).
+    """
     pp = sku_segment_two_chars(product_name or "")
-    cc = sku_color_segment_two_chars(color or "")
+    fc = sku_color_segment_two_chars(frame_color or "")
+    lc = sku_color_segment_two_chars(lens_color or "")
     gg = sku_segment_two_chars(gender or "")
     pa = sku_segment_two_chars(palette or "")
     seg_st = sku_segment_two_chars(style or "")
-    return f"{pp}-{cc}-{gg}-{pa}-{seg_st}"
+    return f"{pp}-{fc}-{lc}-{gg}-{pa}-{seg_st}"
 
 
 def _next_sku_sequence(conn: sqlite3.Connection) -> int:
