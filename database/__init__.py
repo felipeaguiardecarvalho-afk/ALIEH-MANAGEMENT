@@ -1,7 +1,11 @@
 """
-Camada de persistência: um único SQLite (`business.db` na raiz do projeto).
+Camada de persistência: SQLite na raiz do projeto.
 
-- `init_db` em `database.init_db`: cria/migra o schema no go-live local.
+- **Streamlit Community Cloud (live):** sempre `business.db` (detecção automática).
+- **Outro servidor de produção:** `ALIEH_PRODUCTION=true` → `business.db`.
+- **Dev local:** por defeito `businessdev.db`, ou `sqlite_filename` / `ALIEH_SQLITE`.
+
+- `init_db` em `database.init_db`: cria/migra o schema.
 - Módulos `db_*.py`: mapa tabelas ↔ páginas Streamlit.
 """
 

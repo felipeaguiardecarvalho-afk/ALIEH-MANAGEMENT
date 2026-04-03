@@ -1825,6 +1825,37 @@ def fetch_revenue_timeseries():
     return df
 
 
+def _maybe_sidebar_database_export() -> None:
+    """
+    Quando `allow_database_export` está definido em Streamlit Secrets (ex.: Cloud),
+    mostra um botão para descarregar o SQLite ativo (`DB_PATH`) — útil no Cloud para backup.
+    Desativar o segredo logo após o download.
+    """
+    try:
+        allow = st.secrets.get("allow_database_export", False)
+    except Exception:
+        allow = False
+    if isinstance(allow, str):
+        allow = allow.strip().lower() in ("1", "true", "yes", "on")
+    if not bool(allow):
+        return
+    with st.sidebar.expander("Backup do banco (admin)", expanded=False):
+        st.caption(
+            "Descarregue o SQLite uma vez e desative o segredo `allow_database_export` no painel do Streamlit."
+        )
+        if DB_PATH.is_file():
+            _db_leaf = DB_PATH.name
+            st.download_button(
+                f"Descarregar {_db_leaf}",
+                data=DB_PATH.read_bytes(),
+                file_name=_db_leaf,
+                mime="application/octet-stream",
+                key="alieh_export_sqlite_db",
+            )
+        else:
+            st.warning("Ficheiro de base de dados não encontrado neste ambiente.")
+
+
 def main():
     st.set_page_config(page_title="ALIEH — Gestão", layout="wide")
     init_db()
@@ -1957,6 +1988,7 @@ def main():
         ],
         index=0,
     )
+    _maybe_sidebar_database_export()
 
     if page == PAGE_PRODUTOS:
         st.markdown("### Produtos")
