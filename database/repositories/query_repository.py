@@ -344,14 +344,19 @@ def fetch_product_search_attribute_options(tenant_id: str | None = None) -> dict
             ("palette", "palette"),
             ("style", "style"),
         ]:
+            # Distinct + ORDER BY: Postgres exige que o ORDER BY encaixe no DISTINCT;
+            # LOWER(v) com alias interno falha ("column v does not exist"). Subquery
+            # externa permite ORDER BY case-insensitive sobre a coluna projectada.
             rows = db_execute(
                 conn,
                 f"""
-                SELECT DISTINCT TRIM({col}) AS v
-                FROM products
-                WHERE tenant_id = ?
-                  AND {col} IS NOT NULL AND TRIM({col}) != ''
-                  AND deleted_at IS NULL
+                SELECT v FROM (
+                    SELECT DISTINCT TRIM({col}) AS v
+                    FROM products
+                    WHERE tenant_id = ?
+                      AND {col} IS NOT NULL AND TRIM({col}) != ''
+                      AND deleted_at IS NULL
+                ) AS attribute_opts
                 ORDER BY {sql_order_ci("v")};
                 """,
                 (tid,),
