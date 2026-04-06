@@ -15,12 +15,18 @@ from database.sku_codec import (
     _next_sku_sequence,
 )
 from database.sku_master_repo import sync_sku_master_totals
+from database.tenancy import DEFAULT_TENANT_ID
 
 
 def migrate_product_skus_to_generated(conn: sqlite3.Connection) -> None:
+    prod_cols = {r[1] for r in conn.execute("PRAGMA table_info(products);").fetchall()}
+    has_tenant = "tenant_id" in prod_cols
     rows = conn.execute(
         """
         SELECT id, name, frame_color, lens_color, gender, palette, style, sku
+               """
+        + (", tenant_id" if has_tenant else "")
+        + """
         FROM products
         ORDER BY id;
         """
@@ -36,10 +42,15 @@ def migrate_product_skus_to_generated(conn: sqlite3.Connection) -> None:
         )
         old_sku = str(row["sku"] or "").strip()
         oparts = old_sku.split("-")
+        tid = (
+            str(row["tenant_id"]).strip()
+            if has_tenant and row["tenant_id"] is not None and str(row["tenant_id"]).strip()
+            else DEFAULT_TENANT_ID
+        )
         if oparts and oparts[0].isdigit():
             new_sku = f"{oparts[0]}-{body}"
         else:
-            n = _next_sku_sequence(conn)
+            n = _next_sku_sequence(conn, tid)
             new_sku = f"{format_sku_sequence_int(n)}-{body}"
         conn.execute(
             "UPDATE products SET sku = ? WHERE id = ?;",
@@ -48,11 +59,18 @@ def migrate_product_skus_to_generated(conn: sqlite3.Connection) -> None:
 
 
 def backfill_sales_cogs(conn: sqlite3.Connection) -> None:
+    prod_cols = {r[1] for r in conn.execute("PRAGMA table_info(products);").fetchall()}
+    join_tenant = (
+        "JOIN products p ON p.id = s.product_id AND p.tenant_id = s.tenant_id"
+        if "tenant_id" in {r[1] for r in conn.execute("PRAGMA table_info(sales);").fetchall()}
+        and "tenant_id" in prod_cols
+        else "JOIN products p ON p.id = s.product_id"
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT s.id, s.quantity, p.cost
         FROM sales s
-        JOIN products p ON p.id = s.product_id
+        {join_tenant}
         WHERE COALESCE(s.cogs_total, 0) = 0;
         """
     ).fetchall()
@@ -67,56 +85,72 @@ def backfill_sales_cogs(conn: sqlite3.Connection) -> None:
 
 def backfill_sku_master_from_products(conn: sqlite3.Connection) -> None:
     now = datetime.now().isoformat(timespec="seconds")
-    skus = conn.execute(
+    tenants = conn.execute(
         """
-        SELECT DISTINCT sku FROM products
-        WHERE sku IS NOT NULL AND TRIM(sku) != ''
-          AND deleted_at IS NULL;
+        SELECT DISTINCT tenant_id FROM products
+        WHERE deleted_at IS NULL
+          AND sku IS NOT NULL AND TRIM(sku) != '';
         """
     ).fetchall()
-    for row in skus:
-        sku = str(row["sku"]).strip()
-        agg = conn.execute(
+    if not tenants:
+        return
+    for trow in tenants:
+        tid = str(trow["tenant_id"] or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+        skus = conn.execute(
             """
-            SELECT
-                COALESCE(SUM(stock), 0) AS total_st,
-                COALESCE(SUM(stock * COALESCE(cost, 0)), 0) AS cost_sum,
-                COALESCE(SUM(stock * COALESCE(price, 0)), 0) AS price_sum
-            FROM products
-            WHERE sku = ? AND deleted_at IS NULL;
+            SELECT DISTINCT sku FROM products
+            WHERE tenant_id = ?
+              AND sku IS NOT NULL AND TRIM(sku) != ''
+              AND deleted_at IS NULL;
             """,
-            (sku,),
-        ).fetchone()
-        total_st = float(agg["total_st"] or 0)
-        cost_sum = float(agg["cost_sum"] or 0.0)
-        price_sum = float(agg["price_sum"] or 0.0)
-        avg_cost = (cost_sum / total_st) if total_st > 0 else 0.0
-        sell_p = (price_sum / total_st) if total_st > 0 else 0.0
-        conn.execute(
-            """
-            INSERT INTO sku_master (sku, total_stock, avg_unit_cost, selling_price, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(sku) DO UPDATE SET
-                total_stock = excluded.total_stock,
-                avg_unit_cost = excluded.avg_unit_cost,
-                selling_price = CASE
-                    WHEN excluded.selling_price > 0 THEN excluded.selling_price
-                    ELSE sku_master.selling_price
-                END,
-                updated_at = excluded.updated_at;
-            """,
-            (sku, total_st, avg_cost, sell_p, now),
-        )
+            (tid,),
+        ).fetchall()
+        for row in skus:
+            sku = str(row["sku"]).strip()
+            agg = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(stock), 0) AS total_st,
+                    COALESCE(SUM(stock * COALESCE(cost, 0)), 0) AS cost_sum,
+                    COALESCE(SUM(stock * COALESCE(price, 0)), 0) AS price_sum
+                FROM products
+                WHERE tenant_id = ? AND sku = ? AND deleted_at IS NULL;
+                """,
+                (tid, sku),
+            ).fetchone()
+            total_st = float(agg["total_st"] or 0)
+            cost_sum = float(agg["cost_sum"] or 0.0)
+            price_sum = float(agg["price_sum"] or 0.0)
+            avg_cost = (cost_sum / total_st) if total_st > 0 else 0.0
+            sell_p = (price_sum / total_st) if total_st > 0 else 0.0
+            conn.execute(
+                """
+                INSERT INTO sku_master (tenant_id, sku, total_stock, avg_unit_cost, selling_price, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, sku) DO UPDATE SET
+                    total_stock = excluded.total_stock,
+                    avg_unit_cost = excluded.avg_unit_cost,
+                    selling_price = CASE
+                        WHEN excluded.selling_price > 0 THEN excluded.selling_price
+                        ELSE sku_master.selling_price
+                    END,
+                    updated_at = excluded.updated_at;
+                """,
+                (tid, sku, total_st, avg_cost, sell_p, now),
+            )
 
 
 def migrate_sku_cost_component_rows(conn: sqlite3.Connection) -> None:
-    skus = conn.execute("SELECT sku FROM sku_master;").fetchall()
+    skus = conn.execute(
+        "SELECT tenant_id, sku FROM sku_master;",
+    ).fetchall()
     for row in skus:
         sku = str(row["sku"]).strip()
         if not sku:
             continue
-        ensure_sku_cost_component_rows(conn, sku)
-        recompute_sku_structured_cost_total(conn, sku)
+        tid = str(row["tenant_id"] or DEFAULT_TENANT_ID).strip() or DEFAULT_TENANT_ID
+        ensure_sku_cost_component_rows(conn, sku, tenant_id=tid)
+        recompute_sku_structured_cost_total(conn, sku, tenant_id=tid)
 
 
 def migrate_inventory_decimal_v1(conn: sqlite3.Connection) -> None:
@@ -202,25 +236,31 @@ def migrate_inventory_decimal_v1(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE sku_master (
-            sku TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL DEFAULT 'default',
+            sku TEXT NOT NULL,
             total_stock REAL NOT NULL DEFAULT 0,
             avg_unit_cost REAL NOT NULL DEFAULT 0,
             selling_price REAL NOT NULL DEFAULT 0,
             structured_cost_total REAL NOT NULL DEFAULT 0,
-            updated_at TEXT
+            updated_at TEXT,
+            PRIMARY KEY (tenant_id, sku)
         );
         """
     )
     for r in sm_rows:
         sm_dict = dict(r)
         sct = float(sm_dict.get("structured_cost_total") or 0)
+        tid = str(
+            sm_dict.get("tenant_id") or DEFAULT_TENANT_ID
+        ).strip() or DEFAULT_TENANT_ID
         conn.execute(
             """
             INSERT INTO sku_master (
-                sku, total_stock, avg_unit_cost, selling_price, structured_cost_total, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?);
+                tenant_id, sku, total_stock, avg_unit_cost, selling_price, structured_cost_total, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?);
             """,
             (
+                tid,
                 r["sku"],
                 float(r["total_stock"] or 0),
                 float(r["avg_unit_cost"] or 0),
@@ -293,11 +333,23 @@ def migrate_inventory_decimal_v1(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO app_schema_migrations (id) VALUES ('inventory_decimal_v1');"
     )
 
-    skus = conn.execute(
-        """
+    prod_cols = {r[1] for r in conn.execute("PRAGMA table_info(products);").fetchall()}
+    has_tenant = "tenant_id" in prod_cols
+    q = """
         SELECT DISTINCT sku FROM products
         WHERE sku IS NOT NULL AND TRIM(sku) != '';
+    """
+    if has_tenant:
+        q = """
+            SELECT DISTINCT tenant_id, sku FROM products
+            WHERE sku IS NOT NULL AND TRIM(sku) != '';
         """
-    ).fetchall()
+    skus = conn.execute(q).fetchall()
     for row in skus:
-        sync_sku_master_totals(conn, str(row["sku"]).strip())
+        sku = str(row["sku"]).strip()
+        tid = (
+            str(row["tenant_id"]).strip()
+            if has_tenant and row["tenant_id"] is not None
+            else DEFAULT_TENANT_ID
+        )
+        sync_sku_master_totals(conn, sku, tenant_id=tid)

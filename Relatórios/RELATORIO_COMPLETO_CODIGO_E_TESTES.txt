@@ -1,0 +1,657 @@
+================================================================================
+  RELATÓRIO COMPLETO — CÓDIGO E TESTES AUTOMATIZADOS
+  Projeto: ALIEH management (gestão comercial)
+  Documento gerado para inventário técnico, auditoria e onboarding.
+  Data de referência: 2026-04-06 (pytest 73, probe Postgres Supabase: 2026-04-06)
+
+  Para o relatório **detalhado** orientado ao auditor (camadas, Estoque, baixa
+  manual, checklist de evidências), ver **Relatórios/RELATORIO_AUDITOR_ATUALIZACAO_POS_CONTROLES.txt**.
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. VISÃO GERAL DO PROJETO
+────────────────────────────────────────────────────────────────────────────────
+
+A aplicação é um sistema de **gestão comercial** orientado a ótica / varejo de
+produtos com SKU gerado a partir de atributos (nome, cores, paleta, género,
+estilo). O núcleo é:
+
+  • **Interface:** Streamlit (uma única app ``app.py``, navegação por sidebar).
+  • **Persistência:** SQLite no disco, com isolamento lógico **multi-tenant**
+    mediante coluna ``tenant_id`` nas entidades principais.
+  • **Negócio:** cadastro de produtos/lotes, custos por SKU (CMP após entradas
+    de stock), precificação por fluxo (margem / impostos / encargos), vendas com
+    baixa de stock, clientes, painel de indicadores, estoque operacional com
+    exclusão de lote.
+
+Ficheiros na raiz relevantes:
+  • ``app.py`` — UI e orquestração (~3200+ linhas).
+  • ``requirements.txt`` — dependências Python.
+  • ``test_db.py`` — script mínimo legado (lista tabelas de ``database.db``);
+    **não** integra a suite pytest principal.
+  • ``package.json``, ``customers.js``, ``supabaseClient.js`` — artefactos
+    auxiliares / legado; o fluxo principal da app é Python/SQLite/Streamlit.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. STACK E DEPENDÊNCIAS
+────────────────────────────────────────────────────────────────────────────────
+
+Definidas em ``requirements.txt``:
+
+  • **streamlit>=1.29.0** — UI interactiva e ``st.secrets`` em deploy.
+  • **pandas>=2.0.0** — tabelas e transformações na interface.
+  • **pytest>=8.0.0** — testes automatizados (``tests/``).
+
+O código usa apenas biblioteca padrão + streamlit + pandas para o núcleo;
+SQLite via ``sqlite3`` standard. Hash de passwords: ``utils/password_hash.py``
+(normalmente PBKDF2 / campo ``password_hash`` na tabela ``users``).
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. ARRANQUE, CONFIGURAÇÃO E FICHEIRO SQLite
+────────────────────────────────────────────────────────────────────────────────
+
+**Seleção do ficheiro da base** — ``database/connection.py``:
+
+  • **Streamlit Community Cloud** (caminho com ``/mount/src/``): força
+    ``business.db``.
+  • **Produção por variável:** ``ALIEH_PRODUCTION`` ou ``ALIEH_USE_BUSINESS_DB``
+    activos → ``business.db``.
+  • **Desenvolvimento:** ``ALIEH_SQLITE`` ou segredo ``sqlite_filename`` ou
+    padrão ``businessdev.db``.
+
+**Global** ``DB_PATH`` aponta para a raiz do projecto.
+
+**``get_conn()``** abre uma nova ``sqlite3.Connection``, ``row_factory=Row``,
+``PRAGMA foreign_keys = ON``.
+
+**Arranque da app** — ``app.main()``:
+
+  • ``run_database_init()`` (**services/db_startup**) → ``init_db()`` (migrações idempotentes).
+  • Registo de cópia SQLite (atexit / arranque) e ``maybe_run_periodic_maintenance_backups()``.
+  • ``ensure_authenticated_or_stop()`` (login ou modo aberto conforme config).
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. MODELO DE DADOS (INIT_DB E MIGRAÇÕES)
+────────────────────────────────────────────────────────────────────────────────
+
+``database/init_db.py`` cria/altera tabelas e executa migrações (nomes próprios
+em ``database/migrations.py``, ``migrate_sku_master_composite.py``,
+``migrate_sku_master_fks.py``, ``tenant_migrate.py``, etc.).
+
+**Tabelas de negócio principais** (CREATE ou equivalente):
+
+  • **products** — Lotes/linhas de produto com ``tenant_id``, SKU, stock,
+    custos/preços por lote, atributos, código de entrada, imagem, soft-delete
+    ``deleted_at``, ``created_at``.
+  • **sku_master** — Chave composta ``(tenant_id, sku)``: stock agregado,
+    custo médio (CMP), preço de venda activo para vendas; soft-delete.
+  • **sales** — Vendas com ``tenant_id``, ``sale_code`` (formato ``#####V``),
+    referência a ``product_id``, ``customer_id``, quantidades, totais, COGS,
+    forma de pagamento, etc.
+  • **customers** — Clientes com código sequencial por tenant, dados de
+    identificação e morada.
+  • **users** — Utilizadores de login com ``password_hash``, ``role``
+    (admin/operator), ``tenant_id``.
+  • **stock_cost_entries** — Histórico de entradas de stock (CMP antes/depois).
+  • **price_history** — Histórico legado de alterações de preço por SKU.
+  • **sku_pricing_records** — Registos do fluxo de precificação (margem,
+    impostos, encargos, preço alvo, snapshot de CMP, ``is_active``).
+  • **sku_cost_components** — Composição de custo estruturada por componente.
+  • **Contadores:** ``sku_sequence_counter``, ``sale_sequence_counter``,
+    ``customer_sequence_counter`` (por ``tenant_id``).
+
+**Auditoria e segurança de login:**
+
+  • **login_attempt_audit** — Tentativas de login; triggers impedem UPDATE/DELETE.
+  • **login_user_throttle** — Bloqueio por utilizador/tenant após falhas.
+  • **sku_deletion_audit** — Exclusões de SKU registadas; triggers imutabilidade.
+  • **uat_manual_checklist** — Checklist UAT manual persistida por
+    ``(tenant_id, test_id)``.
+
+**Metadados:** ``app_schema_migrations`` (ex.: migração multi-tenant).
+
+**Multi-tenant:** ``database/tenant_migrate.py`` (``migrate_multitenant_prepare``)
+adiciona ``tenant_id`` a tabelas legadas e normaliza contadores; dados existentes
+ficam sob ``default``.
+
+**Identificador efectivo:** ``database/tenancy.py`` — ``effective_tenant_id_for_request``
+com fallback para sessão Streamlit ou ``DEFAULT_TENANT_ID`` (``"default"``).
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. CAMADA ``database/`` — REPOSITÓRIOS, QUERIES E TRANSAÇÕES
+────────────────────────────────────────────────────────────────────────────────
+
+Ficheiros notáveis:
+
+  • **queries.py** — Leituras para o painel e UI: clientes ordenados, SKUs
+    disponíveis para venda, lotes em stock por SKU, registos de precificação,
+    mestre de SKU, labels triplos para selects, entradas de custo recentes,
+    custo unitário estruturado persistido, lotes por SKU, histórico de preços,
+    componentes de custo, ``fetch_products``, opções de atributos para busca,
+    ``search_products_filtered``, ``fetch_product_by_id``, ``compute_dashboard``,
+    ``compute_sales_financials``, ``fetch_revenue_timeseries``.
+
+  • **sales_repo.py** — Validação de cliente, linha de produto para venda
+    (preço activo no mestre, CMP, flags de exclusão), inserção de venda com
+    decremento de stock e ``sync_sku_master_totals``.
+
+  • **transactions.py** — ``transaction(conn, immediate=...)`` com ``BEGIN`` /
+    ``BEGIN IMMEDIATE`` para serialização de escritores (crítico em vendas
+    concorrentes).
+
+  • **customer_repo.py**, **user_repo.py**, **product_write_repo.py**,
+    **sku_master_repo.py**, **stock_receipt_repo.py**, **cost_components_repo.py**
+    — escritas e leituras especializadas.
+  • **repositories/product_repository.py** (e shim **product_write_repo**) —
+    inclui **decrement_product_stock_manual** (baixa só de **products.stock** +
+    **sync_sku_master_totals**).
+
+  • **sku_codec.py** — Corpo do SKU a partir de atributos (geração determinística).
+  • **sku_corrections.py** — ``hard_delete_sku_catalog``, bloqueios de correção,
+    inserção em ``sku_deletion_audit`` + ``log_critical_event``.
+  • **product_edit.py**, **product_images.py**, **product_codes.py** —
+    edição de lote, imagens, códigos de entrada.
+  • **sale_codes.py** — ``format_sale_code``, ``_next_sale_sequence`` (UPDATE
+    atómico do contador).
+
+  • **login_throttle_repo.py** — Persistência de falhas e janela de lockout;
+    integração com ``login_attempt_audit``.
+
+  • **customer_sync.py** — Sincroniza contador de código de cliente.
+  • **db_*.py** — Módulos nomeados por domínio (podem referenciar queries
+    legadas ou agregação).
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. CAMADA ``services/`` — REGRAS DE NEGÓCIO
+────────────────────────────────────────────────────────────────────────────────
+
+**product_service.py** (eventos críticos com vários ``log_critical_event``):
+
+  • Entrada/aplicação de stock ponderada, actualização de preço de venda SKU,
+    alvos de precificação (percentual/absoluto), persistência do fluxo
+    ``save_sku_pricing_workflow``, ``add_stock_receipt``, mutação de atributos
+    de produto com eventual regeneração de SKU, ``generate_product_sku``,
+    ``save_sku_cost_structure``, ``add_product`` (novo lote), preços por lote,
+    exclusão lógica de lote / reset de preços, limpeza de preços.
+  • **apply_manual_stock_write_down** — baixa manual só de ``products.stock``
+    (repositório ``decrement_product_stock_manual``); sem linha em ``sales``;
+    evento ``STOCK_MANUAL_WRITE_DOWN``.
+
+Outros módulos **services/** relevantes para a fachada da UI: **read_queries**,
+**tenant_scope**, **db_startup**, **sqlite_admin**, **uat_checklist_service**,
+**domain_constants**, **product_lot_facade** (delegação a ``database.*`` sem
+import directo desses módulos em ``app.py`` para essas operações).
+
+**sales_service.py**:
+
+  • ``record_sale`` — Transacção ``BEGIN IMMEDIATE``: valida cliente, lê preço e
+    CMP do mestre, stock, desconto, insere venda e baixa stock, sincroniza
+    mestre, regista ``log_critical_event("sale_recorded", ...)``.
+
+**customer_service.py**:
+
+  • Duplicados CPF/telefone, ``insert_customer_row``, ``update_customer_row``,
+    ``delete_customer_row`` (com regras e auditoria onde aplicável).
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. INTERFACE STREAMLIT — ``app.py``
+────────────────────────────────────────────────────────────────────────────────
+
+**Páginas** (constantes ``PAGE_*`` e ``st.sidebar.radio``):
+
+  1. **Produtos** — Busca filtrada por SKU/nome/atributos, detalhe com foto,
+     expansores de edição (foto, atributos do lote), exclusão dura de SKU quando
+     permitido, cadastro de novo produto (SKU derivado).
+  2. **Custos** — Composição de custo por SKU (componentes), entrada de stock
+     com CMP, histórico de entradas.
+  3. **Precificação** — Fluxo por SKU com etapas de margem/impostos/encargos,
+     histórico de precificação e auditoria legada de preços.
+  4. **Estoque** — Página **admin**. **Baixa manual de stock** (expander):
+     quantidade e checkbox de confirmação; **apply_manual_stock_write_down**.
+     Listagem: **st.dataframe** (pandas) com filtros multiselect por coluna,
+     ordenação explícita (SKU / nome / stock), selecção de linha e botão
+     **Excluir lote selecionado** → mesmo diálogo **confirm_exclude_dialog** /
+     ``reset_batch_pricing_and_exclude``. Rodapé **TOTAL GERAL** (somas ponderadas
+     por quantidade como antes).
+  5. **Clientes** — Cadastro (ViaCEP), listagem, edição, exclusão com confirmação.
+  6. **Vendas** — Selecção de SKU/cliente, quantidade, desconto, forma de
+     pagamento, conclusão com ``record_sale``.
+  7. **Painel** — KPIs, DRE simplificada, gráfico de receita, estoque baixo.
+  8. **Checklist UAT** — Formulário interactivo por caso de teste (A.4),
+     persistência em ``uat_manual_checklist`` e ``log_critical_event`` ao gravar.
+
+**Funcções auxiliares no topo do ficheiro:**
+
+  • Integração **ViaCEP** (``fetch_viacep_address``), preview de SKU no cadastro,
+    sessão de edição de cliente, export opcional da base SQLite na sidebar
+    (segredo ``allow_database_export``), renderização da página UAT.
+
+**RBAC (resumo de política implementada):**
+
+  • ``require_operator_or_admin()`` para vendas e operações normais de clientes.
+  • ``require_admin()`` para páginas inteiras **Precificação** e **Estoque**,
+    mutações de catálogo sensíveis, custos gravados, backup DB, exclusão de
+    cliente, etc.
+  • ``is_admin()`` para desactivar botões (UX) alinhado aos mesmos limites.
+  • Helpers em ``utils/rbac.py``; gates de baixo nível em ``utils/app_auth.py``
+    (``require_role``, ``require_any_role``).
+
+**Autenticação** — Sidebar com tenant quando configurada, botão Sair;
+``ensure_authenticated_or_stop`` no início de ``main()``.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. AUTENTICAÇÃO E AUTORIZAÇÃO (DETALHE)
+────────────────────────────────────────────────────────────────────────────────
+
+**``utils/app_auth.py``:**
+
+  • Detecção de **produção** (Cloud, env, etc.).
+  • Credenciais **legacy** (env ``ALIEH_AUTH_*`` ou segredos ``auth`` / pares
+    ``auth_username``/``auth_password``).
+  • Modo **base de utilizadores**: se existir pelo menos um registo em ``users``,
+    o login passa a depender só da BD (legacy fica suplementar com aviso).
+  • Sessão Streamlit: ``alieh_auth_ok``, username, user_id, role, tenant_id.
+  • ``try_login``, limitação de tentativas (SQLite + fallback em sessão),
+    ``login_attempt_audit``, mensagens de rate limit.
+  • ``render_login_and_stop`` / ``ensure_authenticated_or_stop``.
+  • **Perfis:** ``ROLE_ADMIN``, ``ROLE_OPERATOR``; ``get_session_user_role``
+    normaliza a minúsculas.
+
+**RBAC:** com autenticação configurada e sessão inválida, ``require_role`` exige
+login explícito; operadores não satisfazem ``require_admin``.
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. AUDITORIA, BACKUP, WEBHOOK E RECUPERAÇÃO
+────────────────────────────────────────────────────────────────────────────────
+
+**``utils/critical_log.py``:**
+
+  • Ficheiro append-only ``logs/app.log`` (por defeito).
+  • Cadeia **audit_prev** / **audit_chain** (SHA-256 ou HMAC se
+    ``ALIEH_LOG_CHAIN_SECRET`` definido).
+  • ``log_critical_event`` appends linha e opcionalmente envia payload JSON via
+    ``utils/audit_remote_sink.py``.
+  • ``verify_audit_log_file(path)`` — verificação off-line da cadeia.
+
+**``utils/audit_backup.py``:**
+
+  • Intervalo, directórios e desactivação via env e segredos (nomes documentados
+    em ``.streamlit/secrets.toml.example``).
+  • Cópia de ``app.log`` e export JSON das tabelas:
+    ``login_attempt_audit``, ``sku_deletion_audit``, ``price_history``,
+    ``uat_manual_checklist`` (entre outras configuradas).
+  • Estado em ``.audit_backup_state.json``; espelho opcional; invoca
+    ``forward_audit_snapshot`` se activo.
+
+**``utils/audit_remote_sink.py``:**
+
+  • POST opcional para webhook (eventos ``critical_audit`` em tempo real;
+    ``audit_snapshot`` se flag explícita); sem URL não há rede.
+
+**``utils/backup_recovery.py``:**
+
+  • ``verify_sqlite_integrity`` (integrity_check + foreign_key_check).
+  • ``restore_sqlite_from_backup`` (cópia segura; nota Windows sobre fechar
+    ligações).
+  • ``verify_export_row_counts_match_db`` alinhado ao JSON de backup.
+  • ``validate_restored_backup_set`` — relatório agregado pós-restauro.
+
+
+────────────────────────────────────────────────────────────────────────────────
+10. CHECKLIST UAT PERSISTIDO
+────────────────────────────────────────────────────────────────────────────────
+
+**``database/uat_checklist_repo.py``:**
+
+  • Lista ``UAT_MANUAL_CASES`` (UAT-M-01 … UAT-M-11) com títulos e descrições.
+  • Estados: pending, pass, fail, blocked, na.
+  • ``fetch_map_for_tenant``, ``upsert_uat_record``.
+
+Integrado em ``app._render_uat_manual_checklist_page()`` com progresso, tabela
+resumo e expansores por caso.
+
+
+────────────────────────────────────────────────────────────────────────────────
+11. UTILITÁRIOS TRANSVERSAIS
+────────────────────────────────────────────────────────────────────────────────
+
+  • **error_messages.py** — Mensagens de erro e formatadores (clientes, SKU,
+    stock, autenticação, login bloqueado, etc.).
+  • **validators.py** — CEP, CPF, email, quantidades de custo/venda, método de
+    pagamento, nomes de produto, etc.
+  • **formatters.py** — Dinheiro, quantidades com 4 decimais, datas de cadastro.
+  • **env_safe.py** — Tipos de excepção esperados ao ler config/Streamlit.
+
+
+────────────────────────────────────────────────────────────────────────────────
+12. SCRIPTS E ARTEFACTOS PERIFÉRICOS
+────────────────────────────────────────────────────────────────────────────────
+
+  • **scripts/create_alieh_user.py** — Cria utilizador na tabela ``users`` com
+    role e tenant; usa ``init_db`` e pedido de password interactivo.
+
+  • **test_db.py** — Conecta a ``database.db`` na raiz e lista tabelas (não
+    substitui testes pytest).
+
+  • **JavaScript / package.json** — Presença no repositório; não são o alvo
+    principal da app Streamlit documentada aqui.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13. SUITE DE TESTES AUTOMATIZADOS (PYTEST)
+────────────────────────────────────────────────────────────────────────────────
+
+**Localização:** ``tests/`` (pacote com ``__init__.py``).
+
+**Contagem total:** 73 testes (comando na raiz: ``python -m pytest -q``).
+
+**Roteiro de execução sugerido (regressão / CI / após alterações na camada de dados):**
+  1. **Suíte completa:** ``python -m pytest -q`` ou ``python -m pytest -v --tb=short``.
+  2. **Camada de configuração, saúde e probe Supabase:** ``python -m pytest tests/test_database_config.py tests/test_database_health.py tests/test_postgres_probe.py -v``
+     (``DB_PROVIDER`` / ``DATABASE_URL`` automático, fallback Postgres→SQLite, ``SELECT 1`` no motor activo,
+     ``test_postgres_connection`` isolado com ``get_postgres_conn(silent_probe=True)``, thread no arranque).
+  3. **Autorização:** ``python -m pytest tests/test_rbac.py -v``
+  4. **SQL portável:** ``python -m pytest tests/test_sql_compat.py -v``
+  5. **Negócio (stock / vendas):** ``tests/test_concurrent_sales.py``, ``tests/test_manual_stock_write_down.py``
+  6. **Auditoria, backup e export:** ``tests/test_audit_robustness.py``, ``tests/test_backup_recovery.py``, ``tests/test_sqlite_export.py``
+
+────────────────────────────────────────────────────────────────────────────────
+13.1 ``tests/test_rbac.py`` — Autorização (22 casos)
+────────────────────────────────────────────────────────────────────────────────
+
+Simula ``st.session_state`` e substitui ``st.stop`` por excepção de teste.
+
+  • ``require_role(ADMIN)`` com sessão admin (várias capitalizações) → sucesso.
+  • ``require_role(ADMIN)`` com operador → ``st.stop`` / erro.
+  • Não autenticado com auth configurada → ``st.stop``.
+  • Auth **não** configurada → ``require_role`` não bloqueia (modo dev aberto).
+  • ``require_any_role(operator, admin)`` — operador, admin, OPERATOR OK;
+    ``viewer`` bloqueado; **role vazio na sessão** assume operador por defeito
+    (comportamento de ``get_session_user_role``).
+  • ``require_any_role`` sem login → bloqueio.
+  • ``rbac.require_admin`` / ``require_operator_or_admin`` — matrix operador vs
+    admin vs papel desconhecido (guest).
+  • ``is_admin`` / ``is_operator_or_admin`` com auth on/off.
+  • Utilizador autenticado **sem** chave de role → passa gate operador, falha
+    gate admin.
+  • Dupla verificação: operador falha em ``require_role(admin)`` e
+    ``require_admin``.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.2 ``tests/test_concurrent_sales.py`` — Vendas paralelas (3 casos)
+────────────────────────────────────────────────────────────────────────────────
+
+Base SQLite temporária; ``init_db`` + seed mínimo (cliente, produto, sku_master).
+Usa ``ThreadPoolExecutor`` e ``record_sale`` real.
+
+  • **Esgotar stock:** 10 threads × 2 unidades, stock 20 → todas sucedem,
+    ``sale_code`` únicos, stock 0, invariante ``stock + unidades vendidas =
+    inicial``, ``sku_master.total_stock`` alinhado.
+
+  • **Sobre-subscrição:** stock 7, 12 threads × 1 → exactamente 7 sucessos e 5
+    ``ValueError``, stock final 0, invariante.
+
+  • **Stress aleatório:** 30 tarefas qty 1–3 (seed fixo), 15 workers, stock 50;
+    unicidade de códigos, somas e alinhamento mestre.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.3 ``tests/test_audit_robustness.py`` — Integridade da cadeia e backup (7)
+────────────────────────────────────────────────────────────────────────────────
+
+  • Falsificação de **payload** após ``audit_chain`` → verificação falha.
+  • Falsificação de um **dígito** do hash → falha.
+  • **Continuidade pós-restart simulado:** limpar estado em memória e handlers;
+    novo ``log_critical_event`` mantém cadeia válida sobre ficheiro temporal.
+
+  • **Backup periódico:** mocks de caminho de log, export JSON e webhook;
+    primeira execução cria artefactos; segunda não duplica dentro do intervalo.
+
+  • **Backup desactivado** → directório de backup não criado.
+
+  • Ficheiro de auditoria inexistente ou vazio → ``verify`` retorna sucesso sem
+    erros.
+
+(``ALIEH_LOG_CHAIN_SECRET`` removido nos testes para SHA-256 simples.)
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.4 ``tests/test_backup_recovery.py`` — Recuperação de backup (4)
+────────────────────────────────────────────────────────────────────────────────
+
+  • Perda de dados (DELETE clientes), restaurar cópia de ``*.bak`` para ficheiro
+    **novo** ``restored_live.db`` (evitar lock do Windows no ``live.db`` usado
+    pelo init); integridade, contagens, e ``validate_restored_backup_set`` com
+    cópia do ``app.log`` de pacote.
+
+  • JSON de export coerente → ``verify_export_row_counts_match_db`` vazio;
+    export com lista de clientes vazia quando a BD tem linhas → discrepância.
+
+  • Backup inexistente → ``FileNotFoundError``.
+
+  • Ficheiro que não é SQLite → ``verify_sqlite_integrity`` falha com mensagem
+    clara.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.5 ``tests/test_database_config.py`` — Configuração de BD (16)
+────────────────────────────────────────────────────────────────────────────────
+
+  • ``get_database_provider`` / ``DATABASE_URL`` automático, logs ``Database selected``,
+    fallback de ligação Postgres→SQLite (só modo auto), ``get_postgres_conn`` (timeout,
+    preferência de URL), ``get_conn`` / ``get_db_conn``, DSN Supabase.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.6 ``tests/test_database_health.py`` — Saúde da BD (5)
+────────────────────────────────────────────────────────────────────────────────
+
+  • ``check_database_health`` (``SELECT 1 AS ok``), sem fallback com ``DB_PROVIDER`` explícito;
+    ``maybe_run_periodic_database_health`` (intervalo ``DATABASE_HEALTH_INTERVAL_SECONDS``);
+    ``services/db_startup.run_database_init``: ``init_db`` → ``check_database_health`` →
+    ``schedule_postgres_connectivity_probe_on_startup`` (thread daemon; não bloqueia a UI).
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.7 ``tests/test_postgres_probe.py`` — Conectividade Postgres / Supabase isolada (7)
+────────────────────────────────────────────────────────────────────────────────
+
+  • ``database/health_check.test_postgres_connection`` (``SELECT 1``, logs OK/FAILED sem credenciais);
+    ``get_postgres_conn(silent_probe=True)`` não marca «Using database: postgres»;
+    ``schedule_postgres_connectivity_probe_on_startup`` (thread daemon; ``ALIEH_SKIP_POSTGRES_STARTUP_PROBE``);
+    CLI ``python -m database.health_check`` (exit 0/1).
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.8 ``tests/test_manual_stock_write_down.py`` — Baixa manual (5)
+────────────────────────────────────────────────────────────────────────────────
+
+  • Repositório ``decrement_product_stock_manual`` e serviço
+    ``apply_manual_stock_write_down``; invariantes de custo/preço e ``sku_master``;
+    erros de negócio; esgotamento a zero.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13.9 ``tests/test_sql_compat.py`` (2) e ``tests/test_sqlite_export.py`` (2)
+────────────────────────────────────────────────────────────────────────────────
+
+  • Placeholders SQL; validação de export SQLite para JSON/CSV quando aplicável.
+
+
+────────────────────────────────────────────────────────────────────────────────
+14. COMO EXECUTAR OS TESTES
+────────────────────────────────────────────────────────────────────────────────
+
+Na raiz do projecto:
+
+  python -m pytest
+  python -m pytest -v
+  python -m pytest tests/test_rbac.py
+  python -m pytest tests/test_concurrent_sales.py
+  python -m pytest tests/test_audit_robustness.py
+  python -m pytest tests/test_backup_recovery.py
+  python -m pytest tests/test_database_config.py
+  python -m pytest tests/test_database_health.py
+  python -m pytest tests/test_postgres_probe.py
+  python -m pytest tests/test_manual_stock_write_down.py
+
+
+────────────────────────────────────────────────────────────────────────────────
+15. DOCUMENTAÇÃO DE CONFIGURAÇÃO (STREAMLIT / AMBIENTE)
+────────────────────────────────────────────────────────────────────────────────
+
+O ficheiro **``.streamlit/secrets.toml.example``** descreve (comentários):
+
+  • Ambiente produção vs dev, nome do SQLite, auth legacy vs utilizadores na BD.
+  • ``ALIEH_LOG_CHAIN_SECRET``, intervalos e pastas de **audit backup**, webhook
+    de auditoria (URL, timeout, headers, snapshots), export pontual da base.
+
+Valores reais devem viver em ``secrets.toml`` local (gitignored) ou variáveis
+de ambiente no host.
+
+Para observabilidade Postgres sem mudar o motor por defeito: ``DATABASE_URL`` /
+``SUPABASE_DB_URL``, ``DATABASE_CONNECT_TIMEOUT``, ``DATABASE_HEALTH_INTERVAL_SECONDS``,
+``ALIEH_SKIP_POSTGRES_STARTUP_PROBE``; comando manual ``python -m database.health_check``.
+
+
+────────────────────────────────────────────────────────────────────────────────
+16. LIMITAÇÕES E EXTENSÕES FUTURAS (PERSPECTIVA TÉCNICA)
+────────────────────────────────────────────────────────────────────────────────
+
+  • A UI não tem suite E2E (Playwright) — a cobertura concentra-se em serviços,
+    RBAC, auditoria, concorrência de vendas e recuperação.
+  • Substituição **in-place** do SQLite em Windows exige fecho de todas as
+    ligações ao ficheiro (ver ``backup_recovery``).
+  • ``app.py`` concentra grande volume de lógica de apresentação — evoluções
+    podem modularizar por páginas sem alterar contratos de serviço.
+  • Escalabilidade horizontal: modelo actual é SQLite single-file; migração para
+    servidor SQL seria mudança arquitectural separada.
+
+
+────────────────────────────────────────────────────────────────────────────────
+17. FICHEIROS PYTHON INVENTARIADOS (56 .py no repositório de aplicação)
+────────────────────────────────────────────────────────────────────────────────
+
+Raiz: app.py, test_db.py
+
+database/: connection, health_check, init_db, tenancy, queries, migrations, tenants, sales_repo,
+  customer_repo, user_repo, product_write_repo, sku_master_repo, stock_receipt_repo,
+  cost_components_repo, transactions, constants, sale_codes, sku_codec,
+  sku_corrections, product_edit, product_images, product_codes, customer_sync,
+  login_throttle_repo, uat_checklist_repo, migrate_*, db_*, __init__
+
+services/: product_service, sales_service, customer_service, read_queries,
+  tenant_scope, db_startup, sqlite_admin, uat_checklist_service, domain_constants,
+  product_lot_facade
+
+utils/: app_auth, rbac, critical_log, audit_backup, audit_remote_sink,
+  backup_recovery, error_messages, validators, formatters, password_hash, env_safe
+
+scripts/: create_alieh_user.py
+
+tests/: test_rbac, test_concurrent_sales, test_audit_robustness,
+  test_backup_recovery, test_database_config, test_database_health,
+  test_postgres_probe, test_manual_stock_write_down, test_sql_compat, test_sqlite_export, __init__
+
+
+────────────────────────────────────────────────────────────────────────────────
+18. INVENTÁRIO EXACTO DOS 73 TESTES (``pytest --collect-only -q`` na raiz)
+────────────────────────────────────────────────────────────────────────────────
+
+tests/test_audit_robustness.py::test_verify_audit_detects_tampered_payload
+tests/test_audit_robustness.py::test_verify_audit_detects_tampered_hash
+tests/test_audit_robustness.py::test_chain_continuity_after_simulated_restart
+tests/test_audit_robustness.py::test_periodic_audit_backup_creates_artifacts_and_respects_interval
+tests/test_audit_robustness.py::test_sqlite_full_backup_creates_timestamped_file_and_prunes
+tests/test_audit_robustness.py::test_periodic_audit_backup_skipped_when_disabled
+tests/test_audit_robustness.py::test_verify_empty_or_missing_file_is_ok
+
+tests/test_backup_recovery.py::test_restore_after_data_loss_integrity_and_counts
+tests/test_backup_recovery.py::test_validate_export_json_row_counts
+tests/test_backup_recovery.py::test_restore_missing_backup_raises
+tests/test_backup_recovery.py::test_verify_integrity_detects_corrupt_db
+
+tests/test_concurrent_sales.py::test_concurrent_sales_all_succeed_stock_zero
+tests/test_concurrent_sales.py::test_concurrent_sales_oversubscribe_partial_failures
+tests/test_concurrent_sales.py::test_concurrent_sales_stress_random_quantities
+
+tests/test_database_config.py::test_db_provider_defaults_sqlite
+tests/test_database_config.py::test_get_database_provider_postgres_when_database_url_only
+tests/test_database_config.py::test_database_selected_log_fallback_mode
+tests/test_database_config.py::test_database_selected_log_postgres_url
+tests/test_database_config.py::test_get_db_conn_fallback_sqlite_when_postgres_fails
+tests/test_database_config.py::test_get_db_conn_no_fallback_when_explicit_postgres
+tests/test_database_config.py::test_db_provider_postgres_synonyms
+tests/test_database_config.py::test_db_provider_invalid
+tests/test_database_config.py::test_get_postgres_dsn_from_env
+tests/test_database_config.py::test_get_conn_rejects_postgres_provider
+tests/test_database_config.py::test_get_conn_sqlite_after_revert
+tests/test_database_config.py::test_get_db_conn_matches_sqlite_path
+tests/test_database_config.py::test_get_postgres_conn_uses_supabase_url
+tests/test_database_config.py::test_get_postgres_conn_prefers_database_url
+tests/test_database_config.py::test_get_postgres_conn_connect_timeout_env
+tests/test_database_config.py::test_log_using_database_sqlite
+
+tests/test_database_health.py::test_check_database_health_returns_true_for_sqlite
+tests/test_database_health.py::test_check_database_health_no_fallback_explicit_postgres
+tests/test_database_health.py::test_maybe_periodic_skips_when_interval_zero
+tests/test_database_health.py::test_maybe_periodic_respects_interval
+tests/test_database_health.py::test_run_database_init_calls_check_health
+
+tests/test_postgres_probe.py::test_test_postgres_connection_ok
+tests/test_postgres_probe.py::test_test_postgres_connection_ok_logs
+tests/test_postgres_probe.py::test_test_postgres_connection_failure_logs_summary
+tests/test_postgres_probe.py::test_get_postgres_conn_silent_probe_skips_using_database_log
+tests/test_postgres_probe.py::test_schedule_postgres_probe_skipped_when_skip_env
+tests/test_postgres_probe.py::test_schedule_postgres_probe_starts_daemon_thread
+tests/test_postgres_probe.py::test_test_postgres_connection_no_dsn
+
+tests/test_manual_stock_write_down.py::test_decrement_product_stock_manual_reduces_stock_keeps_cost_price
+tests/test_manual_stock_write_down.py::test_apply_manual_stock_write_down_service
+tests/test_manual_stock_write_down.py::test_decrement_rejects_insufficient_stock
+tests/test_manual_stock_write_down.py::test_decrement_rejects_non_positive_qty
+tests/test_manual_stock_write_down.py::test_decrement_allows_full_depletion
+
+tests/test_rbac.py::test_require_role_admin_allows_admin_session[admin]
+tests/test_rbac.py::test_require_role_admin_allows_admin_session[ADMIN]
+tests/test_rbac.py::test_require_role_admin_allows_admin_session[Admin]
+tests/test_rbac.py::test_require_role_admin_blocks_operator
+tests/test_rbac.py::test_require_role_blocks_when_not_logged_in
+tests/test_rbac.py::test_require_role_noop_when_auth_not_configured
+tests/test_rbac.py::test_require_any_role_operator_or_admin[operator-True]
+tests/test_rbac.py::test_require_any_role_operator_or_admin[admin-True]
+tests/test_rbac.py::test_require_any_role_operator_or_admin[OPERATOR-True]
+tests/test_rbac.py::test_require_any_role_operator_or_admin[viewer-False]
+tests/test_rbac.py::test_require_any_role_operator_or_admin[-True]
+tests/test_rbac.py::test_require_any_role_not_logged_in
+tests/test_rbac.py::test_require_admin_blocks_operator
+tests/test_rbac.py::test_require_admin_allows_admin
+tests/test_rbac.py::test_require_operator_or_admin_allows_operator
+tests/test_rbac.py::test_require_operator_or_admin_blocks_unknown_role
+tests/test_rbac.py::test_is_admin_true_when_auth_disabled
+tests/test_rbac.py::test_is_admin_false_operator_when_auth_on
+tests/test_rbac.py::test_is_admin_true_admin_when_auth_on
+tests/test_rbac.py::test_is_operator_or_admin_false_when_auth_on_not_logged_in
+tests/test_rbac.py::test_authenticated_without_role_defaults_to_operator_for_gates
+tests/test_rbac.py::test_operator_cannot_pass_admin_gate_multiple_entry_points
+
+tests/test_sql_compat.py::test_qmarks_skips_quoted_literals
+tests/test_sql_compat.py::test_adapt_sql_respects_provider
+
+tests/test_sqlite_export.py::test_export_all_data_writes_json_csv_and_manifest
+tests/test_sqlite_export.py::test_export_all_data_requires_sqlite_provider
+
+
+================================================================================
+FIM DO RELATÓRIO
+================================================================================

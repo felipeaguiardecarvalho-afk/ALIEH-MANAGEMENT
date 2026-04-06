@@ -1,0 +1,456 @@
+================================================================================
+RELATÓRIO TÉCNICO PARA AUDITORIA — PREPARAÇÃO PARA SUPABASE / POSTGRESQL
+Projeto: ALIEH management (aplicação Streamlit + camada database)
+================================================================================
+
+Data de elaboração (referência do código-base): Abril 2026 (actualização: pooler, 75 testes)
+Tipo de documento: relatório minucioso para auditor interno/externo, com foco em
+  preparação técnica para hospedagem da base de dados em Supabase (PostgreSQL
+  gerido), continuidade operacional, riscos residuais e evidências no código.
+
+Este texto complementa RELATORIO_AUDITOR_ATUALIZACAO_POS_CONTROLES.txt e
+RELATORIO_SEGURANCA_AUDITOR.txt (quando existente). Não constitui avaliação
+jurídica (LGPD), pen-test, nem certificação de conformidade do fornecedor
+Supabase; descreve o desenho e as práticas implementadas no repositório.
+
+Tom: rastreável (ficheiros, variáveis de ambiente, artefactos), explícito sobre
+lacunas e trabalho ainda necessário antes de produção exclusiva em Supabase.
+
+
+--------------------------------------------------------------------------------
+1. ÂMBITO E OBJETIVOS DO RELATÓRIO
+--------------------------------------------------------------------------------
+
+1.1 Objetivos
+  - Documentar o modo dual de persistência: SQLite (predefinição operacional
+    atual em muitos cenários) e PostgreSQL via driver psycopg 3, activável
+    por configuração.
+  - Explicar como o projecto antecipa Supabase: nomeadamente URI de ligação
+    (`SUPABASE_DB_URL`), `schema.sql` de paridade, exportação SQLite → ficheiros
+    para ETL, e uso de SQL portável (`database/sql_compat.py`).
+  - Listar controlos relevantes para auditoria (multi-tenant, autenticação,
+    segredos, auditoria em ficheiro e tabelas).
+  - Identificar de forma explícita o que está maduro versus o que permanece
+    como dever de diligência antes do cutover para Postgres/Supabase.
+
+1.2 Limitações declaradas
+  - O módulo principal da app (`app.py` / `database/*`) não usa necessariamente
+    o cliente Python `supabase` para SQL transaccional; a linha SQL directa
+    passa por **psycopg** quando `DB_PROVIDER` aponta para Postgres. Existe
+    código paralelo (`alieh_supabase/`, `modules/supabase/` em JS) que usa
+    URL + chave anon do Supabase — trata-se de **pistas distintas** no mesmo
+    repositório; o auditor deve separar o âmbito de cada uma (ver secção 9).
+  - Row Level Security (RLS), políticas no painel Supabase, pooling (PgBouncer),
+    níveis de isolamento em produção e gestão de credenciais no Secret Manager
+    são, em grande parte, **responsabilidade operacional** fora do escopo de
+    garantia deste código isoladamente.
+  - A função `init_db()` em `database/init_db.py` **não aplica schema em
+    PostgreSQL** (retorno antecipado se `get_db_provider() != "sqlite"`). O
+    provisionamento Postgres/Supabase baseia-se em **`schema.sql`** ou
+    pipeline próprio (ver secção 5).
+
+
+--------------------------------------------------------------------------------
+2. RESUMO EXECUTIVO PARA DECISÃO
+--------------------------------------------------------------------------------
+
+2.1 Estado geral
+  - O sistema foi desenhado para **não acoplar** a lógica de negócio a APIs
+    exclusivas do SQLite: queries da camada de repositórios e grande parte do
+    SQL de negócio usa `db_execute()` com placeholders `?` convertidos para
+    `%s` em Postgres (`database/sql_compat.py`).
+  - Existe **ficheiro declarativo** `schema.sql` na raiz, explicitamente
+    documentado como “PostgreSQL (Supabase)” com tipos mapeados (TEXT, NUMERIC,
+    BIGINT, BIGSERIAL), `tenant_id` em tabelas de negócio, FKs compostas para
+    `sku_master`, índices de unicidade para login (`lower(username)`), triggers
+    de imutabilidade em tabelas de auditoria seleccionadas, e `ON CONFLICT`
+    para contadores.
+  - A ligação Postgres prioriza **`SUPABASE_DB_URL`** (env ou secreto Streamlit
+    `supabase_db_url`) — alinhamento directo com o painel Supabase (connection
+    string / pooling conforme a escolha de operações).
+
+2.2 Riscos residuais principais (alto nível)
+  - **Cutover**: sem `init_db()` automático em Postgres, qualquer desvio entre
+    o estado real do SQLite pós-migrações locais e o `schema.sql` versionado
+    deve ser detectado por revisão ou testes de integração em staging.
+  - **Dupla linha Supabase**: cliente JS (`SUPABASE_URL` / anon key) vs
+    Postgres URI no Python; políticas e superfície de ataque diferem — exige
+    inventário de quem lê/escreve por qual canal.
+  - **RLS**: `schema.sql` indica “Reveja extensões/políticas RLS à parte”; a
+    app assume filtro `tenant_id` na aplicação — defesa em profundidade em
+    Supabase normalmente acrescenta RLS.
+
+
+--------------------------------------------------------------------------------
+3. ARQUITECTURA DE DADOS (VISÃO LÓGICA)
+--------------------------------------------------------------------------------
+
+3.1 Provedor de base de dados
+  - Variável de ambiente: **`DB_PROVIDER`** (`database/config.py`).
+  - Valores normalizados:
+      • SQLite: `sqlite`, `file` (ou omissão / vazio).
+      • PostgreSQL: `postgres`, `postgresql`, `pg`, **`supabase`**
+        (sinónimos case-insensitive).
+  - Função de leitura: `get_db_provider()` → literal `"sqlite"` | `"postgres"`.
+
+3.2 Entrada única de conexão (código Python)
+  - `database/connection.py`:
+      • **`get_db_conn()`** — ramifica para `get_conn()` (SQLite) ou
+        `get_postgres_conn()` (psycopg) consoante `get_db_provider()`.
+      • **`get_postgres_conn()`** — `psycopg.connect` com `autocommit=True`,
+        `prepare_threshold=0`, `sslmode` alinhado ao DSN, `row_factory=dict_row`,
+        opcional `hostaddr` (IPv4); após ligar: `DISCARD ALL`, `SET SESSION CHARACTERISTICS
+        AS TRANSACTION READ WRITE`, patch de `cursor(..., binary=False)` por defeito; log
+        «PgBouncer safe mode enabled (no prepared statements)». Blocos atómicos usam
+        `conn.transaction()` (não dependem de autocommit=False na conexão global).
+      • **`describe_active_database()`** — mascaramento de password em DSN
+        para logs (regex sobre o URI).
+  - Uso recomendado fora do pacote interno: `use_connection(None)` em
+    `database/repositories/support.py` para não espalhar `get_db_conn()` em
+    serviços (`services/`, `utils/app_auth.py`, scripts) — reduz risco de
+    bypass do modo dual.
+
+3.3 Resolução do DSN (Postgres / Supabase)
+  - `get_supabase_db_url()`:
+      1) `SUPABASE_DB_URL` no ambiente
+      2) Segredos Streamlit: `supabase_db_url` ou chave homónima em maiúsculas
+  - `get_postgres_dsn()`: percorre, por ordem:
+      `SUPABASE_DB_URL`, `DATABASE_URL`, `POSTGRES_DSN`, `ALIEH_DATABASE_URL`,
+      depois segredos (`database_url`, `postgres_url`, etc.) — ver lista em
+      `POSTGRES_DSN_ENV_VARS` e `_POSTGRES_SECRET_KEYS` em `database/config.py`.
+  - `_require_postgres_dsn()` em `connection.py` usa `get_supabase_db_url() OR
+    get_postgres_dsn()` — **Supabase tem precedência explícita** na cadeia de
+    fallback do projecto.
+  - `database/schema_apply.py`: `reset_postgres_schema()` (DROP/CREATE `public` + grants)
+    e `apply_schema_to_postgres()` com **cursor novo por instrução SQL** na mesma
+    transacção — mitigação explícita de `DuplicatePreparedStatement` com PgBouncer.
+
+
+--------------------------------------------------------------------------------
+4. SQLITE VS POSTGRES — COMPORTAMENTO E PARIDADE
+--------------------------------------------------------------------------------
+
+4.1 Inicialização e migrações
+  - **`init_db()`** (`database/init_db.py`): executa `CREATE TABLE IF NOT EXISTS`,
+    migrações incrementais e rotinas de alteração **apenas quando o provedor é
+    SQLite**. Comentário de cabeçalho referencia `schema.sql` para paridade
+    Postgres/Supabase e mapa de tipos (TEXT, NUMERIC, BIGINT, etc.).
+  - **Implicação para auditoria**: em ambiente `DB_PROVIDER=postgres`, o sistema
+    **pressupõe** que o schema remoto já foi aplicado (SQL Editor Supabase,
+    CI/CD, ou ferramenta de migração). Não há, no momento da revisão deste
+    relatório, um “migrator” único que reproduza automaticamente todas as
+     migrações Python contra Postgres.
+
+4.2 SQL portável (`database/sql_compat.py`)
+  - **`db_execute(conn, sql, params)`** — adapta placeholders `?` → `%s` quando
+    o provedor activo não é SQLite (`adapt_sql` depende de `get_db_provider()`).
+  - **`run_insert_returning_id`** — SQLite usa `lastrowid`; Postgres anexa
+    `RETURNING <pk>` ao INSERT.
+  - **`sql_order_ci`** — SQLite: `COLLATE NOCASE`; Postgres: `LOWER(column)`.
+  - **`sql_numeric_sort_key_text`** — ordenação numérica de TEXT (ex. código de
+    cliente) com semântica alinhada entre motores (`CAST(… AS REAL)` com vazio
+    tratado como `0`).
+  - **`INTEGRITY_VIOLATION_ERRORS`** — tuplo que inclui `sqlite3.IntegrityError`
+    e `psycopg.errors.UniqueViolation` quando disponível — útil para fluxos
+    de criação de utilizador.
+
+4.3 Transacções (`database/transactions.py`)
+  - **`transaction(conn)`** — SQLite: `BEGIN` / `COMMIT` / `ROLLBACK` manual;
+    Postgres: `with conn.transaction()` (psycopg).
+  - Comportamento distinto para `BEGIN IMMEDIATE` (só SQLite); parâmetro
+    `immediate` ignorado em Postgres — documentado na docstring.
+
+4.4 Multi-tenant (`database/tenancy.py`)
+  - **`DEFAULT_TENANT_ID = "default"`** — preserva instalações mono-inquilino.
+  - **`effective_tenant_id_for_request`** — deriva inquilino da sessão
+    Streamlit após login quando não injectado.
+  - **`iter_distinct_tenant_ids(conn)`** — ramo SQLite usa `PRAGMA table_info`;
+    ramo Postgres consulta **`information_schema.columns`** e depois
+    `SELECT DISTINCT tenant_id FROM <tabela>` via `db_execute`. Isto prova
+    consciência explícita de introspecção distinta por motor.
+
+4.5 Funcionalidades SQL modernas partilhadas
+  - Vários fluxos usam **`UPDATE … RETURNING`** (ex.: contadores de sequência
+    em `database/repositories/customer_repository.py`, `database/sale_codes.py`).
+    Isto exige SQLite adequadamente recente (suporte a RETURNING em UPDATE) **e**
+    PostgreSQL — ambos satisfeitos nos alvos típicos de produção.
+
+4.6 Tipos e flags
+  - Em `schema.sql`, flags 0/1 modeladas como **BIGINT + CHECK**, coerente com
+    o uso de comparações `= 0`, `= 1` no SQL da aplicação (sem dependência de
+    tipo BOOLEAN nativo).
+
+
+--------------------------------------------------------------------------------
+5. ARTEFACTO `schema.sql` — PREPARAÇÃO DIRECTA PARA SUPABASE
+--------------------------------------------------------------------------------
+
+5.1 Conteúdo e filosofia
+  - Cabeçalho declara: execução no **SQL Editor** Supabase em base vazia; revisão
+    de **RLS** e extensões à parte.
+  - Tabela **`app_schema_migrations`** — placeholder para rastreio de scripts
+    aplicados (integração futura ou uso manual).
+  - Cobertura: `products`, `sku_master`, `customers`, `users` (com índice único
+    `(tenant_id, lower(username))`), contadores `*_sequence_counter`,
+    `price_history`, `sku_cost_components`, `sku_pricing_records`,
+    `stock_cost_entries`, `sales`, tabelas de auditoria/UAT (`sku_deletion_audit`,
+    `login_user_throttle`, `login_attempt_audit`, `uat_manual_checklist`).
+  - **Triggers PL/pgSQL** impedem `UPDATE`/`DELETE` em `login_attempt_audit` e
+    `sku_deletion_audit` — paridade conceptual com imutabilidade exigida em
+    auditoria.
+  - Nota de versão: comentário sobre **`EXECUTE FUNCTION`** vs
+    **`EXECUTE PROCEDURE`** consoante PostgreSQL 14+ vs 13 — relevante se o
+    projecto Supabase estiver num major específico.
+
+5.2 FKs e integridade
+  - FKs compostas `(tenant_id, sku)` → `sku_master` e `(tenant_id, id)` em
+    `products` / `customers` reforçam isolamento referencial **por inquilino**,
+    não apenas por id numérico global.
+
+5.3 Sementes
+  - `INSERT … ON CONFLICT DO NOTHING` para linhas iniciais dos contadores por
+    `tenant_id = 'default'`.
+
+5.4 Recomendação de auditoria
+  - Comparar **lista de tabelas e colunas** geradas pelo SQLite após `init_db()`
+    completo (incl. migrações em `database/migrations.py`, `tenant_migrate.py`,
+    etc.) com `schema.sql` — procurar colunas ausentes (ex.: campos acrescentados
+    só em `ALTER` SQLite e não reflectidos no ficheiro Postgres).
+  - Manter `schema.sql` sob **controlo de versão** e associar cada alteração a
+    ticket/revisão — rasto para SOX/ISO dependente da política da organização.
+
+
+--------------------------------------------------------------------------------
+6. MIGRAÇÃO DE DADOS (SQLite → SUPABASE)
+--------------------------------------------------------------------------------
+
+6.0 Carga directa (`database/migrate_sqlite_to_postgres.py`)
+  - Opcional **`--full-reset`**: `reset_postgres_schema` → `apply_schema_to_postgres` →
+    `migrate_all_data`. Caminhos SQLite em **`--sqlite` / `ALIEH_MIGRATE_SQLITE`** têm de ser
+    **absolutos**; validação de ficheiro, tamanho (MB), preflight `COUNT(*)` em `products` e
+    `sales`; por tabela `SELECT *` + logs «SQLite rows found» / «Inserted».
+
+6.1 Exportação (`database/sqlite_export.py`)
+  - Propósito declarado: exportação completa para **JSON/CSV** com `manifest.json`
+    e ordem sugerida de importação respeitando FKs (`_PREFERRED_TABLE_ORDER`).
+  - Descoberta de tabelas via **`sqlite_master`** (específico de SQLite — apenas
+    o export corre contra SQLite).
+  - Nota no código: possível necessidade de **`session_replication_role = replica`**
+    ou import com FKs adiadas em Postgres — o auditor deve validar o playbook
+    ETL final com a equipa de dados.
+  - Variável/pasta: `ALIEH_SQLITE_EXPORT_ROOT` ou segredo `alieh_sqlite_export_root`;
+    raiz por defeito documentada como `/backups/export/`.
+
+6.2 Checklist de integridade sugerido (não automatizado no relatório)
+  - Contagens de linhas por tabela e por `tenant_id` antes/depois.
+  - Verificação de **sequências** (`last_value` dos contadores vs MAX ids /
+    códigos derivados).
+  - Amostragem de vendas (`sales`) com encadeamento `product_id`, `customer_id`,
+    `sku` coerente com `tenant_id`.
+
+6.3 Backup operacional SQLite existente
+  - `utils/audit_backup.py`, backup binário via `database/sqlite_tools.py` — útil
+    para **continuidade pré-migração** e evidência; pós-Supabase, a política de
+    backup deve migrar para snapshots RDS/Supabase + export lógico.
+
+
+--------------------------------------------------------------------------------
+7. CAMADA DE REPOSITÓRIOS E SERVIÇOS
+--------------------------------------------------------------------------------
+
+7.1 Localização
+  - `database/repositories/` — módulos: `query_repository`, `product_repository`,
+    `customer_repository`, `sales_repository`, `user_repository`,
+    `analytics_bi_repository`, `support.py`.
+
+7.2 Padrão
+  - Uso de **`use_connection(conn)`** para aceitar conexão injectada (testes /
+    transaccoções) ou abrir nova via `get_db_conn()` quando `conn is None`.
+  - Predominância de **`db_execute`** e **`run_insert_returning_id`** — alinhado
+    com secção 4.2.
+
+7.3 Risco de SQL residual específico de dialecto
+  - A auditoria deve continuar a vigiar módulos **fora** de `repositories/` que
+    ainda contenham `get_db_conn()` ou SQL cru (ex.: `database/product_edit.py`,
+    `database/sku_corrections.py`) — estas rotinas fazem parte da superfície de
+    risco de regressão em Postgres até estarem uniformizadas ou cobertas por
+    testes de integração Postgres.
+
+
+--------------------------------------------------------------------------------
+8. AUTENTICAÇÃO, SEGREDOS E AMBIENTE
+--------------------------------------------------------------------------------
+
+8.1 Modelo de login (`utils/app_auth.py` — resumo)
+  - Modo BD: utilizadores na tabela `users` com hash de senha; modo legacy
+    (secrets/env) quando a tabela está vazia; bloqueio em produção se nenhum
+    modo estiver configurado.
+  - Throttle de tentativas com persistência em BD + fallback em sessão.
+  - Pós-migração Supabase: mesma lógica **desde que** o schema `users` e índices
+    de unicidade estejam aplicados como em `schema.sql`.
+
+8.2 Segredos e ficheiros sensíveis (`.gitignore`)
+  - Exclusão de `.streamlit/secrets.toml`, `.env*`, `*.db`, `/data/`, `/backups/`,
+    `/logs/`, `audit_backups/`, etc. — reduz risco de vazamento accidental de DSN
+    e dumps em repositório público.
+
+8.3 Documentação de exemplo (`.streamlit/secrets.toml.example`)
+  - Instruções para `DB_PROVIDER=postgres`, `SUPABASE_DB_URL` / `supabase_db_url`,
+    alternativas `DATABASE_URL`, exportação para migração, webhook de auditoria,
+    cadeia de integridade de logs — útil como guia, não contém segredos reais.
+
+
+--------------------------------------------------------------------------------
+9. OUTRAS INTEGRAÇÕES “SUPABASE” NO REPOSITÓRIO (SEPARAR ÂMBITOS)
+--------------------------------------------------------------------------------
+
+9.1 Cliente Python `supabase` (pacote `requirements.txt`: `supabase>=2.4.0`)
+  - Utilizado em **`alieh_supabase/`** (app Streamlit separada, `create_client`,
+    health de storage) — **não substitui** automaticamente a pilha `psycopg` da
+    app principal para SQL relacional transaccional.
+
+9.2 Módulos Node (`modules/supabase/client.js`, `supabaseClient.js`)
+  - Usam `SUPABASE_URL` e **`SUPABASE_ANON_KEY`** — padrão tipico de Supabase JS.
+  - Superficie: operações via API PostgREST (sujeitas a RLS no projecto Supabase),
+    diferente de conexão directa com connection string ao Postgres.
+
+9.3 Implicação para auditor
+  - Inventariar **todos** os canais de escrita leitura à mesma base lógica:
+    (A) Streamlit principal + psycopg, (B) cliente JS anon, (C) SQL Editor/manual,
+    (D) possíveis Edge Functions futuras. Evitar políticas de segurança incoerentes
+    entre canais.
+
+
+--------------------------------------------------------------------------------
+10. DEPENDÊNCIAS E TESTES AUTOMATIZADOS
+--------------------------------------------------------------------------------
+
+10.1 Dependências relevantes (`requirements.txt`)
+  - `streamlit`, `pandas`, `plotly`, `pytest`, **`psycopg[binary]>=3.1.0`**,
+    `supabase>=2.4.0`.
+
+10.2 Testes observados (`tests/`)
+  - Suíte agregada: **75** casos com `pytest tests/` (ex.: excluir
+    `tests/test_postgres_integration.py` quando o job CI não define `ALIEH_PG_INTEGRATION`).
+  - `test_sql_compat.py` — alternância `DB_PROVIDER=postgres` para `adapt_sql`.
+  - `test_database_config.py` — sinónimos `supabase` → postgres, DSN, patch de
+    `get_postgres_conn` (`autocommit`, `prepare_threshold`, `sslmode`, etc.).
+  - `test_postgres_probe.py` / `database/health_check.py` — probe com
+    `get_postgres_conn(silent_probe=True)`; **health_check** faz `load_dotenv` na raiz;
+    thread daemon opcional no arranque; CLI `python -m database.health_check`.
+  - `test_backup_recovery`, `test_concurrent_sales`, `test_manual_stock_write_down`:
+    fixtures com `DB_PROVIDER=sqlite` para não herdar `DATABASE_URL` do ambiente local.
+  - **Limitação**: a suite não substitui testes de integração com instância
+    Postgres real ou projecto Supabase de staging (recomendado antes do go-live).
+
+10.3 Auditar CI/CD
+  - Verificar se pipelines executam `pytest` e se existe gate para regressões
+    SQL (por exemplo job opcional contra container Postgres com `schema.sql`
+    aplicado).
+
+
+--------------------------------------------------------------------------------
+11. AUDITORIA, LOGS E RASTREABILIDADE OPERACIONAL
+--------------------------------------------------------------------------------
+
+11.1 Logs críticos e cópias (`utils/critical_log.py`, `utils/audit_backup.py`,
+     `database/audit_table_export.py`)
+  - Export JSON de tabelas de auditoria usa `db_execute` dentro da camada
+    `database/` — compatível com dual-mode se as tabelas existirem no destino.
+  - Webhook opcional para SIEM (variáveis documentadas em `secrets.toml.example`).
+
+11.2 Supabase e auditoria
+  - Após migração: confirmar retenção de logs da plataforma Supabase, export
+    periódico, e se triggers de imutabilidade em Postgres cobrem os mesmos
+    requisitos legais que os triggers SQLite históricos.
+
+
+--------------------------------------------------------------------------------
+12. LACUNAS, RISCOS E RECOMENDAÇÕES PRIORITÁRIAS
+--------------------------------------------------------------------------------
+
+12.1 Prioridade alta
+  [H1] Aplicar e versionar **`schema.sql`** (ou migrações equivalentes) em ambiente
+       Supabase de **staging**, executar bateria de testes manuais/regressão na
+       app com `DB_PROVIDER=postgres` (ou `supabase`).
+  [H2] Validar **paridade de schema** SQLite pós `init_db` vs `schema.sql`
+       (diff automatizado ou checklist por tabela).
+  [H3] Definir política **RLS** no Supabase se dados sensíveis forem expostos
+       também via PostgREST/anon key — a app não substitui isolamento à nível
+       de base quando há APIs públicas.
+  [H4] Playbook ETL fechado: ordem de carga, desactivação temporária de FKs se
+       necessário, reconcile de sequências, teste de rollback.
+
+12.2 Prioridade média
+  [M1] Testes de integração Postgres/Supabase na CI (container `postgres:16` ou
+       similar com `schema.sql`).
+  [M2] Documentar qual connection string usar (**pooling** vs sessão directa)
+       consoante limites do Supabase e do Streamlit (muitas conexões curtas).
+  [M3] Rever módulos `database/*` que ainda chamam `get_db_conn()` directamente
+       para convergência com `use_connection` e redução de divergências futuras.
+
+12.3 Prioridade baixa / governança
+  [L1] Política de rotação de `SUPABASE_DB_URL` (service role vs limited user).
+  [L2] Mapear dependência exacta da versão PostgreSQL no Supabase vs sintaxe
+       `EXECUTE FUNCTION` nos triggers de `schema.sql`.
+
+12.4 Sinais de maturidade já presentes (para balanço do auditor)
+  - Dual provider explícito; DSN Supabase prioritário; `schema.sql` rico;
+    `sql_compat`; transacções abstractas; multi-tenant com introspecção Postgres;
+    export SQLite; testes unitários de config/sql compat; `.gitignore` de
+    segredos; documentação em `secrets.toml.example` e docstrings de `init_db`.
+
+
+--------------------------------------------------------------------------------
+13. CHECKLIST PRÉ GO-LIVE (SUPABASE POSTGRES COMO BD PRIMÁRIA DA APP)
+--------------------------------------------------------------------------------
+
+  [ ] `schema.sql` aplicado na instância-alvo; triggers testados na versão PG
+      efectiva do Supabase.
+  [ ] `SUPABASE_DB_URL` (ou utilizador dedicado com princípio do menor privilégio)
+      configurado no ambiente de execução Streamlit/hosting; segredos fora do repo.
+  [ ] `DB_PROVIDER=postgres` ou `supabase` definido de forma consistente em
+      todos os replicas/processos.
+  [ ] ETL de SQLite executado; contagens e amostras validadas; sequências
+      alinhadas.
+  [ ] Ensaio completo de login, vendas, clientes, relatórios BI, export auditoria.
+  [ ] Decisão documentada sobre RLS, anon key, e uso de `alieh_supabase`/JS.
+  [ ] Plano de backup/restore na plataforma alvo (RPO/RTO acordados).
+  [ ] `pytest` verde + evidência de smoke tests em staging Postgres.
+
+
+--------------------------------------------------------------------------------
+14. TABELA-RÉSUMO — FICHEIROS-CHAVE PARA AMOSTRAGEM PELO AUDITOR
+--------------------------------------------------------------------------------
+
+  database/config.py              — DB_PROVIDER, ordem DSN, get_supabase_db_url
+  database/connection.py          — get_db_conn, get_postgres_conn (pooler-safe), masking logs
+  database/schema_apply.py        — reset_postgres_schema, apply_schema (cursor isolado)
+  database/migrate_sqlite_to_postgres.py — carga SQLite→Postgres, --full-reset
+  database/sql_compat.py          — db_execute, RETURNING, ordenação portável
+  database/transactions.py        — BEGIN vs psycopg transaction
+  database/init_db.py             — SQLite-only; referência a schema.sql
+  database/tenancy.py             — tenant_id, information_schema em Postgres
+  schema.sql                      — schema Supabase/Postgres, triggers auditoria
+  database/sqlite_export.py       — export JSON/CSV para migração
+  database/repositories/*.py      — uso de db_execute / use_connection
+  .streamlit/secrets.toml.example — variáveis documentadas
+  requirements.txt                — psycopg, supabase
+  tests/test_database_config.py   — evidência automatizada parcial
+  tests/test_sql_compat.py        — placeholders Postgres
+
+
+--------------------------------------------------------------------------------
+FECHO
+--------------------------------------------------------------------------------
+
+O projecto ALIEH management apresenta **preparação substancial** para operar com
+PostgreSQL compatível com Supabase, com ênfase em URI dedicada (`SUPABASE_DB_URL`),
+schema declarativo (`schema.sql`), camada de compatibilidade SQL e exportação
+para migração. A **transição segura** depende de execução disciplinada do playbook
+de migração, validação de paridade de schema, testes em ambiente Postgres real,
+e decisões de segurança à nível Supabase (RLS, chaves, pooling) que ultrapassam
+o âmbito estrito do código applicacional aqui descrito.
+
+________________________________________________________________________________
+Fim do relatório RELATORIO_AUDITOR_PREPARACAO_SUPABASE.txt

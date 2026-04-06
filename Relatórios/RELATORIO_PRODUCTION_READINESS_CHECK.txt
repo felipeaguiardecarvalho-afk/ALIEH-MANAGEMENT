@@ -1,0 +1,200 @@
+================================================================================
+RELATORIO — PRODUCTION READINESS CHECK (Postgres / Supabase)
+================================================================================
+Data de redaccao: 2026-04-02
+Modulo: python -m database.production_readiness_check
+Ficheiro principal: database/production_readiness_check.py
+Suporte: database/repositories/readiness_probe_repository.py
+         fetch_sale_row_by_code em database/repositories/sales_repository.py
+================================================================================
+
+1. OBJECTIVO
+--------------------------------------------------------------------------------
+Validacao automatica e repetivel de que o ambiente esta pronto para deploy com
+Postgres (ex.: Supabase), sem aceitar sucesso "falso" via SQLite.
+
+Confirma-se em cadeia:
+  - Configuracao explicita de Postgres + DATABASE_URL
+  - Ligacao real (get_postgres_conn + SELECT 1)
+  - Motor efectivo psycopg (anti-fallback SQLite)
+  - Fluxo de negocio: produto -> precificacao -> cliente -> venda com baixa de
+    stock, usando as MESMAS camadas (services + repositorios) que a aplicacao
+  - Remocao completa dos dados do tenant sintetico (cleanup transaccional)
+
+================================================================================
+2. PRE-REQUISITOS
+--------------------------------------------------------------------------------
+2.1 Ficheiro .env na raiz do projecto (BASE_DIR de database.config)
+    - load_dotenv(Path(BASE_DIR) / ".env", override=False)
+    - Variaveis ja definidas no processo tem prioridade sobre o ficheiro.
+
+2.2 DATABASE_URL
+    - Obrigatorio: nao vazio apos strip.
+    - Falha exemplo: [FAIL] ENV -> DATABASE_URL ausente ou vazio...
+
+2.3 DB_PROVIDER
+    - Obrigatorio estar EXPLICITAMENTE preenchido (vazio NAO e aceite).
+    - Normalizacao via database.config._normalize_db_provider:
+      postgres, postgresql, pg, supabase -> modo postgres
+    - Falha se nao resolver para postgres.
+
+2.4 Schema Postgres
+    - Tabelas e constraints alinhadas ao schema da app (sales, products,
+      customers, sku_master, contadores, etc.).
+
+2.5 Rede
+    - DSN valido; a ligacao usa a mesma stack da app (SSL, pooler-safe, etc.).
+
+================================================================================
+3. FLUXO DE EXECUCAO (ETAPAS)
+--------------------------------------------------------------------------------
+3.1 Logging
+    - basicConfig: nivel INFO, formato so mensagem, stream=sys.stdout
+    - Opcional: sys.stdout.reconfigure(encoding=utf-8, errors=replace) [Windows]
+
+3.2 Validacao ENV
+    - Apos load_dotenv, _validate_env()
+    - Sucesso: [OK] ENV validado
+
+3.3 Tenant isolado
+    - tenant_id = "prodchk_" + 20 caracteres hex (UUID4)
+    - Todo o dado de teste etiquetado com este tenant_id
+
+3.4 Contadores de sequencia (nova tenant)
+    - write_transaction(immediate=True)
+    - ensure_readiness_probe_sequence_counters:
+        INSERT sku_sequence_counter / customer_sequence_counter /
+        sale_sequence_counter com ON CONFLICT DO NOTHING
+    - Evita "contador nao inicializado" em customer_sequence_next, vendas, SKU
+    - Sucesso: [OK] sequencias do tenant de verificacao garantidas
+
+3.5 Teste de ligacao Postgres
+    - with get_postgres_conn() as conn: conn.execute("SELECT 1")
+    - Log obrigatorio: Postgres connection OK
+    - Log adicional: [OK] conexao Postgres
+
+3.6 Verificacao motor psycopg
+    - get_db_conn() numa ligacao efemera
+    - isinstance(conn, psycopg.Connection) — senao falha (fallback SQLite / erro)
+    - conn.close() no finally
+
+3.7 Escrita de negocio (somente services)
+    a) add_product — nome "Prod readiness <8 hex>", stock 5.0, unit_cost 20.0,
+       atributos: Preto, Cinza, Aviador, Classico, Unissex, data hoje,
+       tenant_id=tid. Retorno: enter_code.
+
+    b) get_distinct_skus_for_enter_code — exactamente 1 SKU; sku nao vazio.
+
+    c) update_sku_selling_price — 100.0, nota production_readiness_check,
+       tenant_id=tid (preco de lista antes da venda).
+
+    d) insert_customer_row — "Cliente readiness <suffix>", opcionais None,
+       tenant_id=tid. Retorno: customer_code.
+
+    e) fetch_customers_ordered — resolver customer_id pelo customer_code.
+
+    f) fetch_products — resolver product_id pelo enter_code; stock inicial = 5.0
+       (tolerancia 1e-9).
+
+    g) record_sale — product_id, qty=2, customer_id, discount 0.0,
+       payment_method="Pix", tenant_id=tid.
+       (transaccao interna: validacoes, baixa stock, INSERT sales, sequencia)
+
+3.8 Leituras de verificacao (repositorios)
+    - fetch_product_by_id — stock apos venda
+    - fetch_sale_row_by_code — customer_id, product_id, quantity, total, sku
+
+3.9 Validacoes de consistencia
+    - final_total > 0
+    - abs(final_total - 200.0) < 1e-6  (2 * 100.0)
+    - abs(stock_after - (stock_before - 2)) < 1e-9  (5 -> 3)
+    - Linha de venda existe
+    - sale_row["customer_id"] == customer_id
+    - sale_row["product_id"] == product_id
+
+    Sucesso: [OK] escrita/leitura  e  [OK] integridade  ; exit_code = 0
+
+3.10 Erros
+    - ProductionReadinessError: mensagem [FAIL] ... (esperado)
+    - Outras excepcoes: [FAIL] etapa inesperada -> ... com traceback
+
+3.11 Cleanup (finally, se tenant_id nao for None)
+    - write_transaction + delete_readiness_probe_tenant_data
+
+    Ordem de DELETE (FK-seguro):
+      sales
+      stock_cost_entries
+      sku_pricing_records
+      sku_cost_components
+      price_history
+      products
+      customers
+      sku_master
+      sku_sequence_counter
+      customer_sequence_counter
+      sale_sequence_counter
+    (filtro tenant_id = tid em todas)
+
+    Sucesso: [OK] cleanup
+    Falha: [FAIL] cleanup -> ...  e exit_code forcado para 1
+
+3.12 Saida final CLI
+    - exit_code 0: print exacto no codigo — PRODUCTION READY ✅
+    - exit_code 1: print exacto no codigo — NOT READY ❌
+    - main() faz sys.exit(run()) — codigo de processo 0 ou 1 para CI/CD
+
+================================================================================
+4. FICHEIROS E RESPONSABILIDADES
+--------------------------------------------------------------------------------
+database/production_readiness_check.py
+  - Orquestracao, ENV, logs, chamadas a services e leituras via repositorios
+  - SELECT 1 no script e apenas o health check minimal; resto via camadas
+
+database/repositories/readiness_probe_repository.py
+  - ensure_readiness_probe_sequence_counters(conn, tenant_id)
+  - delete_readiness_probe_tenant_data(conn, tenant_id)
+  - SQL concentrado aqui para bootstrap/purge do tenant descartavel
+
+database/repositories/sales_repository.py
+  - fetch_sale_row_by_code(conn, sale_code=..., tenant_id=...)
+  - Validacao de customer_id / product_id na linha de venda
+
+================================================================================
+5. O QUE O TESTE GARANTE / NAO GARANTE
+--------------------------------------------------------------------------------
+GARANTE:
+  - Config Postgres explicita + URL
+  - Ligacao e query minima via get_postgres_conn
+  - Nao "passa" com SQLite quando se exige psycopg
+  - Caminho feliz cadastro -> preco -> cliente -> venda -> stock
+  - Integridade basica de IDs e valores na venda lida
+  - Remocao do tenant prodchk_*
+
+NAO GARANTE:
+  - Autenticacao Streamlit / RBAC de UI
+  - Carga, concorrencia, latencia
+  - Todos os fluxos da app (devolucoes, hard delete SKU, BI, etc.)
+  - Integridade de OUTROS tenants na mesma base
+  - Nao activa triggers de exclusao de SKU para sku_deletion_audit (o probe
+    nao usa hard_delete_sku_catalog; purge e por DELETE ordenado no repositorio)
+
+================================================================================
+6. RELACAO COM PYTEST
+--------------------------------------------------------------------------------
+- Cenario alinhado a tests/test_postgres_integration.py (produto, cliente, venda)
+- Readiness check e mais rigido: DB_PROVIDER obrigatorio, verificacao psycopg,
+  cleanup sempre no finally quando tenant_id foi definido
+- pytest pode seguir maioritariamente em SQLite; este modulo e o "portao"
+  manual/CI antes de deploy Postgres
+
+================================================================================
+7. EXECUCAO RESUMIDA
+--------------------------------------------------------------------------------
+  1. Configurar .env: DATABASE_URL e DB_PROVIDER=postgres (ou sinonimo aceite)
+  2. Na raiz do projecto: python -m database.production_readiness_check
+  3. Interpretar [OK]/[FAIL], Postgres connection OK, e linha final PRODUCTION
+     READY / NOT READY e codigo de saida do processo
+
+================================================================================
+FIM DO RELATORIO
+================================================================================

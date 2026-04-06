@@ -1,0 +1,204 @@
+================================================================================
+RELATÓRIO DE SEGURANÇA — ALIEH MANAGEMENT (gestão Streamlit + SQLite)
+================================================================================
+
+Âmbito: análise com base no repositório (Python/Streamlit, database/, services/,
+utils/, .streamlit/, .gitignore e clientes JS Supabase).
+
+Nota: não substitui pen-test nem revisão do ambiente de hospedagem (Streamlit
+Community Cloud, DNS, SSO, etc.).
+
+
+--------------------------------------------------------------------------------
+1. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+
+O núcleo operacional é uma aplicação Streamlit com SQLite local ao projeto. Há
+controlo de entrada (validação e listas fechadas), consultas parametrizadas à
+base, endurecimento em caminhos de ficheiros de imagem, chaves estrangeiras
+ativas, transações para operações críticas e gestão de segredos via Streamlit
+Secrets (secrets.toml ignorado pelo Git).
+
+Não foi identificado no código Python um modelo completo de autenticação/
+autorização de utilizadores (login com perfis e RBAC na app). A proteção
+perimetral em produção depende em grande parte da plataforma de deploy e da
+política organizacional.
+
+Existe ainda um cliente Supabase em JavaScript com URL e chave anon
+versionadas — padrão comum em frontends, mas com risco residual se as políticas
+RLS no Supabase não estiverem corretas.
+
+
+--------------------------------------------------------------------------------
+2. PROTEÇÃO DE DADOS E CONFIGURAÇÃO
+--------------------------------------------------------------------------------
+
+Segredos locais
+  - .streamlit/secrets.toml está em .gitignore; existe secrets.toml.example
+    sem credenciais sensíveis.
+
+Nome/caminho da BD
+  - database/connection.py: em deploy Streamlit Cloud (/mount/...) força
+    business.db; desenvolvimento pode usar ALIEH_SQLITE, segredo sqlite_filename
+    ou padrão businessdev.db; produção noutro host pode forçar com
+    ALIEH_PRODUCTION ou ALIEH_USE_BUSINESS_DB.
+
+Ficheiros de BD
+  - *.db, *.sqlite, *.sqlite3 no .gitignore — reduz risco de commit acidental.
+
+Exportação de cópia da BD
+  - Funcionalidade “Backup do banco (admin)” em app.py só aparece se
+    allow_database_export estiver ativo nos Streamlit Secrets; documentação pede
+    desativar após uso.
+
+Privacidade Streamlit
+  - .streamlit/config.toml: gatherUsageStats = false — desativa envio de
+    estatísticas de uso ao Streamlit.
+
+
+--------------------------------------------------------------------------------
+3. CAMADA DE BASE DE DADOS (SQLite)
+--------------------------------------------------------------------------------
+
+Integridade referencial
+  - get_conn() executa PRAGMA foreign_keys = ON em cada ligação.
+
+Transações
+  - database/transactions.py: BEGIN / COMMIT e rollback em exceções para
+    operações atómicas.
+
+Injeção SQL
+  - Padrão dominante: conn.execute("... WHERE ... = ?", (valor,)).
+  - Na pesquisa filtrada (search_products_filtered), valores do utilizador passam
+    por params; nomes de colunas em filtros vêm de lista fixa (p.frame_color,
+    etc.); ordenação via order_map com fallback seguro.
+
+Constraints
+  - init_db.py define CHECK em campos relevantes (ex.: stock, quantidades) onde
+    aplicável.
+
+
+--------------------------------------------------------------------------------
+4. VALIDAÇÃO E SANITIZAÇÃO DE ENTRADA
+--------------------------------------------------------------------------------
+
+Concentra-se em utils/validators.py e chamadas nos serviços:
+
+  - CPF: dígitos normalizados e validação de dígitos verificadores
+    (validate_cpf_br).
+  - E-mail opcional: formato por regex quando preenchido.
+  - CEP: apenas dígitos antes de pedido HTTP (sanitize_cep_digits) — ViaCEP em
+    HTTPS.
+  - Quantidades/preços (custos/vendas): parsers e regras de negócio; forma de
+    pagamento restrita a SALE_PAYMENT_OPTIONS em database/constants.py.
+  - Busca de produtos (LIKE): _sku_search_sanitize_text remove % e _ do termo
+    para mitigar manipulação de padrão em LIKE.
+
+Isto não substitui auditoria de todas as entradas na UI (app.py extenso), mas
+mostra intenção de camada de validação reutilizável.
+
+
+--------------------------------------------------------------------------------
+5. FICHEIROS E ANEXOS (FOTOS DE PRODUTO)
+--------------------------------------------------------------------------------
+
+database/product_images.py:
+
+  - Limite de 8 MB por upload.
+  - Extensões permitidas normalizadas (jpg/png/webp).
+  - Armazenamento com nome {product_id}{ext} sob product_images/ — sem
+    concatenar caminho arbitrário do utilizador na gravação.
+  - Leitura/apagamento: resolve() + relative_to(BASE_DIR) — mitigação de path
+    traversal para caminhos relativos guardados na BD.
+
+
+--------------------------------------------------------------------------------
+6. DADOS PESSOAIS (CLIENTES)
+--------------------------------------------------------------------------------
+
+  - Armazenamento de CPF, telefone e restantes campos; customer_service.py usa
+    consultas parametrizadas e verificação de duplicados.
+
+(LGPD / conformidade): este relatório não avalia base legal, retention, DPIA ou
+DPA — apenas controles técnicos observados no código.
+
+
+--------------------------------------------------------------------------------
+7. INTEGRAÇÕES E TERCEIROS
+--------------------------------------------------------------------------------
+
+ViaCEP
+  - Pedido HTTPS; input restringido a dígitos do CEP.
+
+Google Fonts (CSS)
+  - @import de fonts.googleapis.com no st.markdown — implica pedidos do browser
+    a domínio Google (política de privacidade / conteúdo externo).
+
+Supabase (JS)
+  - modules/supabase/client.js: URL do projeto e chave anon JWT no código.
+  - Comportamento esperado em muitas SPAs; segurança efetiva depende de RLS,
+    políticas e não exposição de operações sensíveis só com chave anon.
+  - Recomenda-se não tratar a chave anon como segredo absoluto, mas revisar
+    políticas e considerar variáveis de ambiente em builds futuros.
+
+O fluxo principal Python/Streamlit + SQLite não depende deste ficheiro JS para o
+core analisado; a exposição afeta sobretudo código Node/frontend que use esse
+módulo.
+
+
+--------------------------------------------------------------------------------
+8. O QUE NÃO ESTÁ COBERTO PELO CÓDIGO ANALISADO (LACUNAS)
+--------------------------------------------------------------------------------
+
+  - Autenticação e autorização na aplicação (utilizadores, papéis, permissões).
+  - Sessão Streamlit: controlo de quem aciona vendas/export/edição cabe à
+    política de acesso ao URL da app (Cloud, VPN, SSO, etc.).
+  - Encriptação em repouso do ficheiro SQLite: depende do sistema de ficheiros /
+    disco do host.
+  - Logs e auditoria centralizados (quem fez o quê): não mapeado além do que a
+    BD guarda implicitamente.
+  - Rate limiting / anti-abuso: controlo de rede/plataforma.
+
+
+--------------------------------------------------------------------------------
+9. EVIDÊNCIAS POR FICHEIRO (REFERÊNCIA RÁPIDA)
+--------------------------------------------------------------------------------
+
+  - Segredos e export: app.py (_maybe_sidebar_database_export), .gitignore,
+    .streamlit/secrets.toml.example
+  - BD: database/connection.py, database/transactions.py, database/init_db.py
+  - SQL parametrizado / pesquisa: database/queries.py, services/
+  - Validação: utils/validators.py
+  - Imagens: database/product_images.py
+  - Supabase: modules/supabase/client.js (+ customers.js)
+
+
+--------------------------------------------------------------------------------
+10. RECOMENDAÇÕES TÍPICAS PARA O AUDITOR
+--------------------------------------------------------------------------------
+
+  1. Documentar quem pode aceder à app em produção e se há rede privada / MFA no
+     Streamlit Cloud ou equivalente.
+  2. Se Supabase for usado em produção: revisão formal de RLS e segregação anon
+     vs service role.
+  3. Remover chaves do repositório ou injetar via CI/CD secrets se a política
+     interna exigir.
+  4. Política de backup: export SQLite só com allow_database_export temporário
+     está alinhado a menor exposição — manter procedimento escrito.
+  5. Revisão periódica de dependências (requirements.txt, package.json) para
+     CVEs.
+
+
+--------------------------------------------------------------------------------
+CONCLUSÃO
+--------------------------------------------------------------------------------
+
+O projeto implementa vários controles técnicos sólidos (parametrização SQL, FKs,
+transações, validação, sanitização de LIKE e de imagens, segredos fora do Git,
+export de BD condicionado). Para um auditor de segurança organizacional /
+acesso, deve complementar-se com a descrição do modelo de acesso humano
+(Streamlit Cloud, partilha de URL, etc.) e, se aplicável, políticas Supabase.
+
+================================================================================
+Fim do relatório
+================================================================================

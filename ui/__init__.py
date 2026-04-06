@@ -1,0 +1,43 @@
+"""Componentes de interface reutilizáveis."""
+
+from ui.components import (
+    BI_COLORS,
+    apply_plotly_bi_theme,
+    bi_card_end,
+    bi_card_start,
+    bi_filter_bar_end,
+    bi_filter_bar_heading,
+    bi_hero,
+    bi_kpi_tile_end,
+    bi_kpi_tile_start,
+    bi_page_divider,
+    bi_section_tables_heading,
+    bi_table_shell_end,
+    bi_table_shell_start,
+    inject_bi_dashboard_css,
+    render_card,
+    render_container,
+    render_insight_box,
+    render_section,
+)
+
+__all__ = [
+    "BI_COLORS",
+    "apply_plotly_bi_theme",
+    "bi_card_end",
+    "bi_card_start",
+    "bi_filter_bar_end",
+    "bi_filter_bar_heading",
+    "bi_hero",
+    "bi_kpi_tile_end",
+    "bi_kpi_tile_start",
+    "bi_page_divider",
+    "bi_section_tables_heading",
+    "bi_table_shell_end",
+    "bi_table_shell_start",
+    "inject_bi_dashboard_css",
+    "render_card",
+    "render_container",
+    "render_insight_box",
+    "render_section",
+]

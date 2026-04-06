@@ -1,0 +1,196 @@
+================================================================================
+RELATÓRIO DE AUDITORIA TÉCNICA — ALIEH management (código e verificação)
+================================================================================
+Data de emissão (UTC):     2026-04-04 (actualização de resultados e inventário: 2026-04)
+Ambiente de execução:      Windows (PowerShell), Python 3.11.9
+Escopo:                    Snapshot de código-fonte + suíte automatizada pytest
+
+Nota de localização: documentação técnica complementar e pormenorizada para o
+auditor encontra-se em **Relatórios/RELATORIO_AUDITOR_ATUALIZACAO_POS_CONTROLES.txt**
+(tratamento minucioso de camadas, Estoque, baixa manual, matriz de riscos e
+checklist). O presente ficheiro mantém o pacote de verificação e o inventário
+de testes executados.
+
+--------------------------------------------------------------------------------
+1. IDENTIFICAÇÃO DO PACOTE DE CÓDIGO
+--------------------------------------------------------------------------------
+
+Caminho do repositório de trabalho (exemplo; ajustar ao ambiente do auditor):
+  …\ALIEH management
+
+Subdirectório **Relatórios/**: relatórios UAT, segurança, auditoria pós-controlos e
+código/testes consolidados.
+
+Referência Git (último commit conhecido no momento da auditoria):
+  Branch:   master
+  Commit:   d08b1b50d3d15a2f8598f551d05147bd288ad2c3
+  Remoto:   origin/master (relato de tracking conforme `git status`)
+
+Nota importante para o auditor:
+  O diretório de trabalho contém alterações não consolidadas em commit
+  (ficheiros modificados, novos e removidos relativamente ao HEAD acima).
+  O backup físico descrito na secção 3 reflecte o estado **actual da pasta
+  de trabalho** (working tree), não apenas o último commit Git, de modo a
+  incluir o código que está a ser executado e testado nesta sessão.
+
+--------------------------------------------------------------------------------
+2. ARTEFACTO DE BACKUP FÍSICO (SNAPSHOT)
+--------------------------------------------------------------------------------
+
+Ficheiro gerado (arquivo ZIP):
+  Nome:     ALIEH_audit_snapshot_20260404_071606.zip
+  Caminho:  <raiz do projeto>\backups\ALIEH_audit_snapshot_20260404_071606.zip
+  Tamanho:  aprox. 17,2 MB (17 997 109 bytes — valores exactos no sistema de ficheiros)
+
+Integridade (SHA-256):
+  3A527DA73E45CB62B37E2578076C60426998AEC3DDC04FB22032528CBEC9F8EA
+
+Método de criação:
+  Comando `tar` com compressão ZIP (`-a -c -f`), a partir da raiz do projeto.
+
+Exclusões aplicadas (reduzir ruído e dados operacionais não essenciais ao código):
+  - node_modules/
+  - __pycache__/
+  - .pytest_cache/
+  - product_images/   (anexos de utilizador)
+  - audit_backups/   (artefactos de auditoria local)
+  - logs/
+  - .env             (credenciais locais; não incluir no arquivo)
+
+Não foi garantida exclusão explícita de ficheiros `*.db` dentro do comando tar
+nesta máquina; o `.gitignore` do projecto previne versionamento de bases SQLite.
+O auditor deve tratar qualquer `.db` presente no ZIP como dado sensível e
+avaliar política de retenção.
+
+O directório `backups/` está listado no `.gitignore` do projecto; o arquivo ZIP
+não deve ser enviado a repositórios públicos sem revisão de conteúdo.
+
+--------------------------------------------------------------------------------
+3. PROCEDIMENTO DE VERIFICAÇÃO AUTOMATIZADA
+--------------------------------------------------------------------------------
+
+3.1 Suíte de testes (pytest)
+  Comando executado:
+    pytest -v --tb=short
+  (com recolha na raiz do projecto; todos os testes em `tests/`)
+
+  Ficheiro de log complementar:
+    backups\pytest_audit_full.log
+    backups\pytest_audit_with_root.log
+
+3.2 Verificação de sintaxe Python (compileall)
+  Comando:
+    python -m compileall -q database services utils tests app.py
+  Resultado: concluído sem erros (exit code 0).
+
+--------------------------------------------------------------------------------
+4. RESULTADOS DOS TESTES
+--------------------------------------------------------------------------------
+
+Resumo (pytest na raiz do projecto) — actualizar contagens com `pytest --collect-only -q`:
+  Total de casos:  73 (referência documental 2026-04-06)
+  Passou:          73 (última execução de verificação no mesmo período)
+  Falhou:          0
+  Ignorado:        0
+  Duração:         tipicamente ~3–6 s (máquina dependente)
+
+Inventário por ficheiro de teste:
+
+  tests/test_audit_robustness.py (7 testes)
+    - Integridade e cadeia de auditoria em log
+    - Backup periódico de auditoria (log + JSON) e intervalo
+    - Backup SQLite completo (hot backup) e retenção de ficheiros
+    - Desactivação de backup de auditoria
+    - Ficheiro de auditoria vazio ou ausente
+
+  tests/test_backup_recovery.py (4 testes)
+    - Restauro pós-perda de dados e contagens
+    - Validação de export JSON
+    - Erro quando backup em falta
+    - Deteção de base corrompida
+
+  tests/test_concurrent_sales.py (3 testes)
+    - Vendas concorrentes, stock a zero, stress com quantidades aleatórias
+
+  tests/test_database_config.py (16 testes)
+    - Auto-detecção DATABASE_URL / sqlite, logs, fallback Postgres→SQLite,
+      timeouts, get_conn / get_db_conn / get_postgres_conn
+
+  tests/test_database_health.py (5 testes)
+    - check_database_health (SELECT 1), periódico opcional, init_db + ordem de arranque
+
+  tests/test_postgres_probe.py (7 testes)
+    - test_postgres_connection isolado, silent_probe, thread no startup, CLI health_check
+
+  tests/test_manual_stock_write_down.py (5 testes)
+    - Baixa manual de stock: repositório + serviço; custo/preço inalterados;
+      sku_master; rejeições; stock zero
+
+  tests/test_rbac.py (22 testes)
+    - Papéis admin/operator, gates, sessão, auth desactivada
+
+  tests/test_sql_compat.py (2 testes)
+    - Placeholders SQL portáveis (SQLite vs Postgres)
+
+  tests/test_sqlite_export.py (2 testes)
+    - Exportação completa SQLite → JSON/CSV + manifest
+    - Recusa quando provider não é sqlite
+
+Nota: O ficheiro `test_db.py` na raiz do projecto não faz parte da colecta
+padrão pytest (nomenclatura / localização); a verificação concentrou-se na
+pasta `tests/` e na compilação de `app.py` e pacotes principais.
+
+--------------------------------------------------------------------------------
+5. COMPONENTES RELEVANTES COBERTOS (RESUMO FUNCIONAL)
+--------------------------------------------------------------------------------
+
+  - Multi-tenant (tenant_id), configuração de base de dados (SQLite / Postgres,
+    auto-detecção, saúde SELECT 1 no arranque, probe opcional Supabase em background + CLI)
+  - Vendas e stock em cenário concorrente
+  - Baixa manual de stock (sem registo de venda), com validação de invariantes na BD
+  - RBAC (controlo de acesso por papel)
+  - SQL compatível entre motores
+  - Cópias de segurança: auditoria (ficheiro + JSON), backup binário SQLite,
+    exportação tabular para migração
+  - Integridade e recuperação (validação / restauro)
+
+--------------------------------------------------------------------------------
+6. CONFORMIDADE E DOCUMENTAÇÃO DE SCHEMA
+--------------------------------------------------------------------------------
+
+  O repositório inclui `schema.sql` com DDL orientado a PostgreSQL / Supabase,
+  documentado como paridade com o modelo pós-`init_db` e migrações. A auditoria
+  de dados em produção (RLS, políticas Supabase, segredos) não foi objecto
+  desta corrida automatizada — recomenda-se checklist separado em ambiente alvo.
+
+--------------------------------------------------------------------------------
+7. RISCOS, LIMITAÇÕES E RECOMENDAÇÕES
+--------------------------------------------------------------------------------
+
+  1) Working tree ≠ último commit: consolidar alterações em commit assinado
+     e etiquetar release se o auditor exigir trilho formal de versão.
+  2) Segredos: `.env` e `.streamlit/secrets.toml` não devem entrar em arquivo
+     público; confirmar que o ZIP de auditoria partilhado não os contém.
+  3) Testes não cobrem UI Streamlit ponta-a-ponta nem carga de produção;
+     complementar com testes manuais ou E2E se necessário.
+  4) Verificar periodicamente o hash SHA-256 do ZIP após transferência
+     (integridade em trânsito).
+
+--------------------------------------------------------------------------------
+8. CONCLUSÃO
+--------------------------------------------------------------------------------
+
+Com base na execução registada neste relatório:
+  - A suíte `pytest` na raiz (73 testes na colecta referenciada) concluiu com **100 % de sucesso**
+    na última verificação documentada.
+  - A compilação sintáctica dos pacotes principais foi **bem-sucedida**.
+  - Foi produzido um **backup físico** do código (ZIP) com hash SHA-256 indicado
+    na secção 2, adequado a arquivo de auditoria **desde que o conteúdo sensível
+    seja revisto** antes de distribuição externa.
+
+Emitido para arquivo de auditoria interna / externa conforme política da
+organização.
+
+================================================================================
+Fim do relatório
+================================================================================

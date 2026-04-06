@@ -1,0 +1,140 @@
+================================================================================
+  ALIEH management — Passo a passo para recuperar um backup completo
+================================================================================
+
+Este guia serve para restaurar o projecto a partir de um arquivo ZIP de backup
+gerado na pasta backups/ (ex.: ALIEH_management_FULL_YYYYMMDD_HHMMSSUTC.zip).
+
+Dentro do ZIP pode existir também um ficheiro BACKUP_README_RECUPERACAO.txt com
+o commit Git e o estado do repositório no momento da cópia. Use-o como
+referência histórica.
+
+
+--------------------------------------------------------------------------------
+1) Pré-requisitos
+--------------------------------------------------------------------------------
+
+  - Python 3.10 ou superior (recomendado; ajuste se o seu ambiente exigir).
+  - pip actualizado (opcional mas útil):  python -m pip install --upgrade pip
+  - Espaço em disco suficiente para extrair o ZIP (o tamanho cresce após
+    extração).
+
+
+--------------------------------------------------------------------------------
+2) Extrair o backup
+--------------------------------------------------------------------------------
+
+  a) Escolha uma pasta destino (ex.: C:\Users\<utilizador>\Documents\ALIEH_restore).
+  b) Extraia o conteúdo completo do ZIP para essa pasta.
+  c) Confirme que vê ficheiros como app.py, requirements.txt e pastas como
+     database/, tests/, utils/, etc.
+
+  Nota: O backup pode incluir a pasta .git. Se estiver presente, o histórico
+  Git local está preservado; se não estiver, trate a pasta como cópia “plana”
+  só para execução e desenvolvimento.
+
+
+--------------------------------------------------------------------------------
+3) Ambiente virtual (recomendado)
+--------------------------------------------------------------------------------
+
+  Na pasta raíz extraída (onde está app.py):
+
+    Windows (PowerShell):
+      python -m venv .venv
+      .\.venv\Scripts\Activate.ps1
+
+    macOS / Linux:
+      python3 -m venv .venv
+      source .venv/bin/activate
+
+
+--------------------------------------------------------------------------------
+4) Instalar dependências Python
+--------------------------------------------------------------------------------
+
+  Na mesma pasta raíz:
+
+    pip install -r requirements.txt
+
+  O requirements.txt inclui, entre outras, streamlit, pandas e pytest.
+
+
+--------------------------------------------------------------------------------
+5) Configurar segredos da aplicação (Streamlit)
+--------------------------------------------------------------------------------
+
+  O ficheiro real de segredos NÃO vem no backup por segurança.
+
+  a) Copie o modelo:
+       .streamlit/secrets.toml.example  →  .streamlit/secrets.toml
+  b) Edite .streamlit/secrets.toml com URLs, chaves e credenciais correctas
+     para o seu ambiente.
+
+  Sem secrets.toml válido, partes da app que dependem de configuração falham ao
+  arrancar ou em runtime.
+
+
+--------------------------------------------------------------------------------
+6) Executar a aplicação
+--------------------------------------------------------------------------------
+
+  Na raíz do projecto (com o venv activado, se usar):
+
+    streamlit run app.py
+
+  Abra o URL indicado no terminal (normalmente http://localhost:8501).
+
+
+--------------------------------------------------------------------------------
+7) Testes automatizados (opcional)
+--------------------------------------------------------------------------------
+
+  Com o mesmo ambiente e dependências instaladas:
+
+    pytest tests/
+
+  Corrija falhas de ambiente (caminhos, base de dados de teste, secrets) antes
+  de interpretar falhas de lógica.
+
+
+--------------------------------------------------------------------------------
+8) Base de dados e ficheiros locais
+--------------------------------------------------------------------------------
+
+  - Se o backup incluir ficheiros *.db ou *.sqlite na árvore, estes reflectem
+    o estado na data do backup.
+  - Se a app criar bases novas vazias, pode ser necessário correr migrações ou
+    scripts de inicialização que o projecto documentar (ex.: init_db), conforme
+    a versão em uso.
+  - Pastas como logs/, audit_backups/ ou product_images/ podem não estar no
+    ZIP; crie-as manualmente se a app esperar que existam.
+
+
+--------------------------------------------------------------------------------
+9) Node / JavaScript (se usar tooling JS na raíz)
+--------------------------------------------------------------------------------
+
+  Se existir package.json e precisar de scripts ou dependências Node:
+
+    npm install
+
+  Só é necessário se a sua rotina de desenvolvimento ou deploy depender disso;
+  o núcleo Streamlit segue Python.
+
+
+--------------------------------------------------------------------------------
+10) Resumo rápido (lista de comandos)
+--------------------------------------------------------------------------------
+
+  cd <pasta_extraída>
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1          rem Windows PowerShell
+  pip install -r requirements.txt
+  copy .streamlit\secrets.toml.example .streamlit\secrets.toml   rem depois edite
+  streamlit run app.py
+  pytest tests/                          rem opcional
+
+================================================================================
+  Fim do guia
+================================================================================

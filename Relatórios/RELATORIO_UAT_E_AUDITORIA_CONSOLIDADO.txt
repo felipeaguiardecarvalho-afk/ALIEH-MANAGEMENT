@@ -1,0 +1,291 @@
+================================================================================
+  RELATÓRIO CONSOLIDADO — UAT (User Acceptance Testing) + AUDITORIA
+  Projeto: ALIEH management
+  Aplicação: Streamlit + SQLite (multi-tenant por coluna tenant_id)
+  Data da execução dos testes automatizados: 2026-04-03
+  Ambiente: workspace local Windows (Python), repositório ALIEH management
+  Nota (arquitectura BD, Abril 2026): **app.py** arranca com
+  **services.db_startup.run_database_init()**, que delega **database.init_db.init_db**;
+  o relatório técnico **RELATORIO_AUDITOR_ATUALIZACAO_POS_CONTROLES.txt** inclui
+  secção 11.3 (fachadas **services/**) e sequência actualizada de **main()**.
+================================================================================
+
+
+================================================================================
+PARTE A — RELATÓRIO DE UAT (USER ACCEPTANCE TESTING)
+================================================================================
+
+A.1 Âmbito e método
+--------------------------------------------------------------------------------
+Este relatório cobre:
+  • Testes **automatizados** executados na linha de comando (sintaxe, base de
+    dados, import da aplicação, integridade do ficheiro de auditoria, registo de
+    evento crítico).
+  • Verificação **estática** (revisão de código e mapeamento de páginas/RBAC)
+    alinhada aos requisitos de negócio implícitos no código.
+  • **Checklist manual** (secção A.4) para completar o UAT na interface Streamlit
+    com credenciais reais de admin e operador — não foi possível simular nesta
+    sessão todos os fluxos de clique, upload de imagem e confirmações de diálogo
+    sem um operador humano na UI.
+
+Critério de “UAT completo” neste documento:
+  • Base técnica: **aceite** com os testes AUTO abaixo.
+  • UAT de negócio **formal**: dependente da conclusão da checklist A.4 com
+    assinatura do responsável de negócio / PO.
+
+
+A.2 Resultados dos testes automatizados executados
+--------------------------------------------------------------------------------
+ID           Descrição                                    Resultado  Notas
+-----------  -------------------------------------------  ---------  ----------
+TC-AUTO-01   Compilação de todos os *.py do projeto       PASS       python -m
+                                                                      py_compile
+                                                                      (sem erros)
+
+TC-AUTO-02   init_db() — criação/atualização de schema    PASS       Mensagem
+                                                                      "init_db: OK"
+                                                                      (teste directo
+                                                                      ao módulo;
+                                                                      em produção
+                                                                      **app.py**
+                                                                      usa
+                                                                      **run_database_init**)
+
+TC-AUTO-03   Import do módulo app.py                      PASS       Dependências
+                                                                      (streamlit,
+                                                                      pandas, …)
+                                                                      carregadas
+
+TC-AUTO-04   verify_audit_log_file() na cadeia          PASS       Retorno (True,
+              audit_chain em logs/app.log                            []) — 0 erros
+                                                                      de cadeia no
+                                                                      momento do teste
+
+TC-AUTO-05   Existência de tabelas após get_conn()        PASS       17 tabelas:
+                                                                      customers,
+                                                                      login_attempt_
+                                                                      audit,
+                                                                      products,
+                                                                      sales,
+                                                                      sku_deletion_
+                                                                      audit, users,
+                                                                      … (lista
+                                                                      completa na
+                                                                      evidência A.6)
+
+TC-AUTO-06   log_critical_event() smoke                   PASS       Linha escrita
+                                                                      com action=
+                                                                      UAT_SMOKE e
+                                                                      audit_chain;
+                                                                      avisos
+                                                                      Streamlit
+                                                                      “bare mode”
+                                                                      esperados
+                                                                      quando não se
+                                                                      usa streamlit
+                                                                      run; sem falha
+                                                                      de excepção
+
+TC-AUTO-07   Baixa manual de stock                        PASS       pytest
+              (decrement_product_stock_manual +                   tests/
+              apply_manual_stock_write_down; stock,             test_manual_stock_
+              custo/preço, sku_master)                         write_down.py
+
+**Resumo automatizado (A.2): 7/7 itens** · **Suite completa ``pytest``:** executar
+``python -m pytest`` na raiz (**73** casos em ``tests/``; roteiro por camada em
+``Relatórios/RELATORIO_COMPLETO_CODIGO_E_TESTES.txt`` §13 — inclui config/saúde de BD,
+baixa manual, RBAC, etc.)
+
+
+A.3 Matriz funcional (revisão estática — requisitos vs implementação)
+--------------------------------------------------------------------------------
+Área / Página        Operação principal              Perfil esperado (código)
+-------------------  -----------------------------  ----------------------------
+Produtos             Leitura / busca SKU            Qualquer utilizador
+                     autenticado (quando auth
+                     activa)
+Produtos             Cadastrar / editar lote /      Administrador (require_admin,
+                     foto / exclusão SKU             is_admin em UI)
+
+Custos               Visualizar CMP / histórico      Operador pode consultar
+                     Entrada de estoque /           Administrador
+                     gravar composição de custo
+
+Precificação         Toda a página                  Administrador (require_admin
+                                                    no início do bloco)
+
+Vendas               Concluir venda                 Operador ou administrador
+                                                    (require_operator_or_admin)
+
+Clientes             Cadastrar / editar             Operador ou administrador
+                     Excluir cliente               Administrador
+
+Estoque              Página inteira                  Administrador
+
+Painel               Dashboards                     Consulta (sem mutações
+                                                   críticas mapeadas nesta
+                                                   revisão)
+
+Backup SQLite        Download (quando allow_*        Administrador (botão
+                     activo)                         disabled se não admin)
+
+Webhook auditoria    Envio HTTP opcional            N/A — configurável por segredo;
+                                                    não afecta fluxo se URL vazia
+
+
+A.4 Checklist manual obrigatória (fecho formal de UAT na UI)
+--------------------------------------------------------------------------------
+Executar com `streamlit run app.py` (ou comando equivalente em produção).
+Marcar [ ] / [x] e datar.
+
+Ambiente com autenticação configurada (produção ou dev com users na BD):
+  [ ] **UAT-M-01** Login **admin** — sucesso; sidebar e páginas visíveis.
+  [ ] **UAT-M-02** Login **operator** — sucesso; páginas **Precificação** e
+        **Estoque** bloqueadas ou inacessíveis conforme política.
+  [ ] **UAT-M-03** Como **operator**: registar **venda** completa (SKU, cliente,
+        quantidade, pagamento) — sucesso e stock coerente.
+  [ ] **UAT-M-04** Como **operator**: **não** conseguir gravar precificação,
+        entrada de custos definitiva, nem cadastro de produto (botões desactivados
+        ou mensagem de acesso negado).
+  [ ] **UAT-M-05** Como **admin**: cadastrar produto mínimo; confirmar aparição
+        na busca por SKU.
+  [ ] **UAT-M-06** Como **admin**: fluxo **Custos** — gravar composição; entrada
+        de stock com confirmação — CMP actualizado.
+  [ ] **UAT-M-07** Como **admin**: **Precificação** — salvar registo; **Vendas**
+        usar preço alvo activo.
+  [ ] **UAT-M-08** Como **admin**: **Clientes** — exclusão com confirmação;
+        tentativa com venda associada deve falhar (regra de negócio).
+  [ ] **UAT-M-09** Como **admin**: **Estoque** — exclusão de lote com diálogo
+        de confirmação.
+  [ ] **UAT-M-09b** Como **admin**: **Estoque** — **baixa manual de stock**
+        (expander *Baixa manual de estoque*): reduzir quantidade com confirmação
+        por checkbox; verificar stock e totais; custo/preço do lote inalterados.
+  [ ] **UAT-M-10** Logout; tentativa de acção sem sessão — comportamento esperado
+        (ensure_authenticated_or_stop).
+
+Ambiente **sem** autenticação configurada (modo dev aberto):
+  [ ] **UAT-M-11** Confirmar com equipa se o modo aberto é aceite neste ambiente;
+        documentar risco (todas as operações disponíveis).
+
+
+A.5 Conclusão UAT (Parte A)
+--------------------------------------------------------------------------------
+  • **Camada técnica e integridade de build:** aprovada (evidência: suite
+    ``pytest`` na raiz do repositório, incluindo baixa manual de stock em
+    ``tests/test_manual_stock_write_down.py``; matriz A.2 com 7 entradas AUTO).
+  • **Aceitação funcional completa:** pendente da execução e assinatura da
+    checklist A.4 pelo responsável de produto / utilizador chave.
+  • **Recomendação:** após completar A.4, arquivar este ficheiro com anexo de
+    prints ou ID de versão git para rastreabilidade.
+
+
+================================================================================
+PARTE B — RELATÓRIO PARA AUDITOR (CONTROLOS E EVIDÊNCIAS)
+================================================================================
+
+B.1 Objeto da auditoria
+--------------------------------------------------------------------------------
+  • Aplicação de gestão ALIEH (Python / Streamlit / SQLite).
+  • Foco: rastreabilidade, segregação de funções (RBAC), registo de auditoria,
+    opção de encaminhamento para SIEM (webhook), e integridade lógica do schema.
+
+
+B.2 Controlo de acessos (RBAC)
+--------------------------------------------------------------------------------
+Implementação revista no código:
+  • Perfis: **admin** e **operator** (utils/app_auth.py — constantes ROLE_*).
+  • Funções de controlo: require_role, require_any_role, wrappers require_admin,
+    require_operator_or_admin, is_admin (utils/rbac.py).
+  • Com autenticação activa e sessão inválida, require_role exige início de
+    sessão (mensagem explícita).
+  • **Precificação** e **Estoque** restringidos a administrador ao nível da
+    página (require_admin no início do bloco).
+  • Mutaciones sensíveis em **Produtos**, **Custos**, **Clientes** (exclusão),
+    **backup DB**: gate administrador ou operador conforme matriz na Parte A.
+Evidência automatizada: importação bem sucedida do módulo app (dependências de
+RBAC resolvidas); testes de UI por perfil ficam para auditoria operacional (A.4).
+
+
+B.3 Rastreabilidade e trilho de auditoria
+--------------------------------------------------------------------------------
+  • **Eventos críticos:** utils/critical_log.py — log_critical_event com cadeia
+    encadeada audit_chain (SHA-256 ou HMAC se ALIEH_LOG_CHAIN_SECRET definido).
+  • **Ficheiro local:** logs/app.log (append-only; sem rotação destrutiva no
+    handler de auditoria).
+  • **Verificação off-line:** verify_audit_log_file() — **PASS** nesta execução.
+  • **Tabelas SQLite imutáveis por trigger (desenho):** login_attempt_audit,
+    sku_deletion_audit — impedem UPDATE/DELETE (ver database/init_db.py).
+  • **Cópias periódicas:** utils/audit_backup.py — app.log + export JSON de
+    tabelas de auditoria / histórico de preços; configurável por variáveis /
+    secrets (intervalo, directórios, desactivação).
+  • **Webhook opcional (SIEM):** utils/audit_remote_sink.py — POST JSON apenas se
+    URL configurada; falhas não impedem registo local; eventos critical_audit em
+    tempo real; audit_snapshot opcional com flag explícita.
+Evidência: TC-AUTO-04, TC-AUTO-06; documentação de chaves em
+.streamlit/secrets.toml.example.
+
+
+B.4 Integridade de dados e base SQLite
+--------------------------------------------------------------------------------
+  • PRAGMA foreign_keys = ON em get_conn() (database/connection.py).
+  • init_db() executado com sucesso nesta sessão (TC-AUTO-02).
+  • Tabelas presentes incluem sequências, mestre de SKU, vendas, clientes,
+    utilizadores (evidência A.6).
+  • **Nota para auditor:** validação contabilística e reconciliação CMP/vendas
+    devem seguir procedimentos internos da entidade; este relatório não substitui
+    auditoria financeira.
+
+
+B.5 Configuração, segredos e ambiente
+--------------------------------------------------------------------------------
+Pontos de configuração relevantes para revisão:
+  • ALIEH_ENV / produção vs dev; ficheiro SQLite (business.db vs businessdev.db).
+  • Autenticação: utilizadores em BD vs legacy; limitação de tentativas e
+    login_attempt_audit (utils/app_auth.py, database/login_throttle_repo.py).
+  • ALIEH_LOG_CHAIN_SECRET — recomendado em produção para fortalecer a cadeia.
+  • ALIEH_AUDIT_* e ALIEH_AUDIT_WEBHOOK_* (backups e webhook).
+  • allow_database_export (Streamlit secrets) — export manual do SQLite.
+O auditor deve confirmar que segredos não estão em repositório (gitignore) e que
+os valores em produção estão no gestor de secrets do host (ex.: Streamlit Cloud).
+
+
+B.6 Evidências coligidas nesta sessão (resumo)
+--------------------------------------------------------------------------------
+  1. py_compile em todos os *.py do projeto: sem erros.
+  2. init_db() concluído com mensagem de sucesso.
+  3. import app: sucesso.
+  4. verify_audit_log_file: sucesso, zero violações reportadas.
+  5. Contagem e nomes de tabelas SQLite (17), por nome:
+        app_schema_migrations, customer_sequence_counter, customers,
+        login_attempt_audit, login_user_throttle, price_history, products,
+        sale_sequence_counter, sales, sku_cost_components, sku_deletion_audit,
+        sku_master, sku_pricing_records, sku_sequence_counter, sqlite_sequence,
+        stock_cost_entries, users.
+  6. log_critical_event("UAT_SMOKE", …): linha emitida com audit_chain.
+
+
+B.7 Limitações e recomendações para o auditor
+--------------------------------------------------------------------------------
+  • Não foi efectuado **pen test**, análise OWASP completa, nem revisão de
+    dependências com ferramenta SCA neste ciclo (recomendável como trabalho
+    paralelo).
+  • Testes de carga e recuperação ante disaster (restore de backup SQLite) não
+    fazem parte desta execução.
+  • Quando o webhook estiver activo, o auditor deve pedir amostra de payloads
+    recebidos no agregador e confirmar retenção legal (LGPD / política interna).
+
+
+B.8 Conclusão auditoria (Parte B)
+--------------------------------------------------------------------------------
+  • Os controlos de **registo append-only com cadeia**, **tabelas de auditoria
+    protegidas por trigger**, **RBAC por página/operação** e **sink HTTP opcional**
+    estão **implementados no código** e a camada técnica base mostrou-se **coerente
+    e operacional** nos testes automáticos descritos.
+  • A **eficácia em produção** (perfis reais, tenant correcto, segredos e
+    encaminhamento para SIEM) deve ser **confirmada por evidência operacional**
+    (logs do servidor, amostras de eventos, execução da checklist A.4).
+
+
+================================================================================
+FIM DO RELATÓRIO CONSOLIDADO
+================================================================================

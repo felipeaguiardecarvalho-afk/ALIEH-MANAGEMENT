@@ -1,0 +1,800 @@
+================================================================================
+RELATÓRIO TÉCNICO PARA AUDITORIA — ALIEH MANAGEMENT
+(Complemento a RELATORIO_SEGURANCA_AUDITOR.txt no repositório)
+================================================================================
+
+Revisão: Abril 2026 — estado do código e controlos em Python / Streamlit /
+SQLite, com detalhe operacional para amostragem, walkthrough, avaliação de
+risco residual e planeamento de evolução (ex.: SaaS multi-inquilino).
+
+  Última actualização documental (revisão minuciosa para auditor): Abril 2026
+  ---------------------------------------------------------------------------
+  **Arquitectura de acesso à base de dados (fachada services/)**
+  - A UI principal (**app.py**) não importa **database.*** para persistência
+    nem para consultas de leitura expostas à navegação: o arranque usa
+    **services.db_startup.run_database_init()** → **database/init_db.init_db**;
+    leituras e tenant efectivo chegam via **services.read_queries** e
+    **services.tenant_scope**; UAT, constantes de domínio, operações de lote/SKU
+    na UI e caminho SQLite administrativo via **services/uat_checklist_service**,
+    **services/domain_constants**, **services/product_lot_facade**,
+    **services/sqlite_admin** (secção 11.3).
+  - **utils/painel_dashboard.py** e **analytics/metrics.py** consomem a
+    mesma fachada de leitura (**services.read_queries**, **services.tenant_scope**),
+    mantendo o painel BI alinhado ao modelo de camadas.
+  - **Infra-estrutura transversal** ainda referencia **database.*** onde é
+    impraticável extrair sem reescrita: **utils/app_auth.py** (users, throttle,
+    tenancy de login), **utils/audit_backup.py** (export de tabelas, DB_PATH),
+    **utils/validators.py** (constantes de métodos de pagamento). Isto está
+    documentado em 11.3 como excepção consciente; o critério de auditoria “**app.py
+    sem database**” mantém-se verificável por `grep`.
+
+  **Página Estoque — Data Grid, filtros, baixa manual e exclusão**
+  - A listagem principal de lotes com stock utiliza **st.dataframe** (pandas),
+    no mesmo padrão visual/interactivo da busca em **Produtos → Busca por SKU e
+    lote**: colunas numéricas com **column_config**, ordenação por select **Ordenar
+    por** (SKU A–Z, Nome A–Z, Estoque ↑/↓), selecção de linha (**on_select** /
+    **single-row**) e botão **Excluir lote selecionado** que reutiliza o diálogo
+    **confirm_exclude_dialog** e **reset_batch_pricing_and_exclude** (sem botão
+    “Excluir” embeddado por linha — limitação do componente Streamlit).
+  - **Baixa manual de stock:** expander **Baixa manual de estoque** (fechado por
+    defeito); selecção de lote, quantidade, aviso de irreversibilidade, checkbox
+    de confirmação, **apply_manual_stock_write_down** (**product_service**), que
+    invoca **decrement_product_stock_manual** em **product_repository**: apenas
+    **UPDATE products SET stock = stock - ?**; **cost** e **price** inalterados;
+    **sync_sku_master_totals** após a baixa (paridade com vendas). Evento
+    **STOCK_MANUAL_WRITE_DOWN** em **log_critical_event**. Contorno Streamlit:
+    **stock_baixa_form_nonce** para alternar a chave do checkbox após sucesso
+    (não alterar **session_state** da chave do widget após instanciação).
+
+  **Observabilidade Postgres / Supabase (sem activar Postgres como motor principal)**
+  - **database/health_check.py** — `load_dotenv` na raiz; `test_postgres_connection()` via
+    `get_postgres_conn(silent_probe=True)`, `SELECT 1`, logs OK/FAILED (sem credenciais).
+    **schedule_postgres_connectivity_probe_on_startup**: thread daemon opcional;
+    **ALIEH_SKIP_POSTGRES_STARTUP_PROBE=1** desactiva. CLI: `python -m database.health_check`.
+  - **database/connection.py** — `silent_probe` no probe; ligação Postgres em modo **pooler-safe**
+    (`autocommit=True`, `prepare_threshold=0`, `DISCARD ALL`, `cursor` com `binary=False` por defeito,
+    IPv4 `hostaddr` quando aplicável, log «PgBouncer safe mode enabled…»). Transacções explícitas
+    com `conn.transaction()`.
+
+  **Repositório de testes automatizados (pytest)**
+  - Suite na raiz: **75** casos (comando típico: `python -m pytest tests/ -q --ignore=tests/test_postgres_integration.py`).
+    Fixtures de **backup_recovery**, **concurrent_sales** e **manual_stock_write_down** fixam
+    **DB_PROVIDER=sqlite** para isolamento quando o ambiente define **DATABASE_URL**. **Roteiro sugerido**:
+    (1) suíte completa; (2) `test_database_config` + `test_database_health` + **test_postgres_probe**;
+    (3) RBAC; (4) `test_sql_compat`; (5) vendas/baixa manual; (6) auditoria, backup, export.
+  - Inventário por ficheiro em **tests/**: **test_audit_robustness** (7),
+    **test_backup_recovery** (4), **test_concurrent_sales** (3),
+    **test_database_config** (18), **test_database_health** (5), **test_postgres_probe** (7),
+    **test_manual_stock_write_down** (5), **test_rbac** (22), **test_sql_compat** (2),
+    **test_sqlite_export** (2), **test_postgres_integration** (3, opt-in).
+
+  **Documentação correlata**
+  - Relatórios consolidados UAT/auditoria residem sob **Relatórios/** no
+    repositório (incl. o presente ficheiro). Matriz **TC-AUTO-07** e checklist
+    **UAT-M-09b** no **RELATORIO_UAT_E_AUDITORIA_CONSOLIDADO.txt** referem a
+    baixa manual.
+
+Este documento não substitui avaliação jurídica (LGPD), teste de penetração,
+política de hospedagem ou contratos de subprocessamento. Descreve o que o
+código faz, onde procurar evidências, dependências entre migrações e lacunas
+inerentes ao desenho.
+
+Nota de consistência documental: RELATORIO_SEGURANCA_AUDITOR.txt contém
+secções históricas (p.ex. ausência de autenticação na app) que o código atual
+já contradiz — usar o presente relatório como referência funcional para auth,
+throttle e auditoria; o relatório de segurança continua útil para validação
+de entrada, Supabase JS e exportação de BD.
+
+Tom: preciso, rastreável por ficheiro, função, tabela e variável de ambiente.
+
+
+--------------------------------------------------------------------------------
+1. FINALIDADE E ÂMBITO DO DOCUMENTO
+--------------------------------------------------------------------------------
+
+  1.1 Objetivo
+  - Dar a um auditor (interno ou externo) uma visão consolidada de:
+      • autenticação (legacy vs utilizadores na BD), sessão e perfis;
+      • limitação de tentativas de login (SQLite + plano B em sessão);
+      • preparação multi-tenant (tenant_id, migração, comportamento por defeito);
+      • registo de eventos críticos (ficheiro append-only com cadeia de hashes);
+      • cópias periódicas de artefactos de auditoria;
+      • camada de dados (repositórios, migrações versionadas, triggers de
+        imutabilidade em tabelas de auditoria);
+      • RBAC parcial na UI (admin vs operator).
+
+  1.2 Fora de âmbito explícito
+  - Código JavaScript (supabaseClient.js, módulos Node), políticas RLS no
+    Supabase, MFA, SIEM corporativo, definição legal de prazo de conservação
+    de logs — salvo hooks preparados no código (logs/app.log, audit_backups/,
+    export JSON de tabelas de auditoria).
+
+  1.3 Relação com o relatório base
+  - Ler RELATORIO_SEGURANCA_AUDITOR.txt para validação/sanitização, imagens,
+    Supabase e export condicionado de SQLite; cruzar com este documento para
+    modelo de autenticação e trilhos de auditoria atualizados.
+
+
+--------------------------------------------------------------------------------
+2. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+
+  2.1 Stack e arranque
+  - Aplicação **Streamlit** monolítica; persistência **SQLite** no disco do
+    projeto (determinação do ficheiro em **database/connection.py**).
+  - Arranque observável (**app.py**, `main()`):
+      (1) `st.set_page_config`
+      (2) **`run_database_init()`** — **services/db_startup.py** → chama
+          **`init_db()`** em **database/init_db.py** (criação incremental,
+          alterações e migrações versionadas — ver secção 10).
+      (3) **`register_sqlite_full_backup_atexit()`** e
+          **`run_startup_sqlite_full_backup_once()`** — **utils/audit_backup.py**
+          (cópia completa SQLite; ver docstring do módulo).
+      (4) **`maybe_run_periodic_maintenance_backups()`** — **utils/audit_backup.py**
+          (orquestra cópias periódicas de auditoria e, quando aplicável, SQLite).
+      (5) **`ensure_authenticated_or_stop()`** — **utils/app_auth.py**.
+
+  2.2 Autenticação
+  - Dois modos **mutuamente exclusivos na validação da palavra-passe**:
+      (i) credencial única **legacy** (env / Streamlit Secrets);
+      (ii) uma ou mais contas na tabela **users** com **PBKDF2**.
+  - **Regra de prioridade:** se **COUNT(users) > 0**, só entram utilizadores da
+    BD; a legacy deixa de validar (UI avisa que legacy está desativada para
+    password). Se **users** está vazia, a legacy mantém-se (instalações antigas).
+  - Resolução de utilizador na BD: **`fetch_user_by_username(conn, username,
+    tenant_id)`** — hoje o login usa explicitamente **`DEFAULT_TENANT_ID`**
+    (**database/tenancy.py**, valor literal **`default`**) para preservar
+    comportamento mono-inquilino até evolução de sessão SaaS.
+
+  2.3 Produção sem credenciais
+  - Em ambiente interpretado como produção/live, sem legacy aplicável **e** sem
+    linhas em **users**, a app **bloqueia** (mensagem + `st.stop()`), antes de
+    ecrãs de negócio.
+  - Sinais de “live” alinhados a **business.db**: deploy Streamlit Cloud
+    (`/mount/src/...` em `connection.py`), **ALIEH_PRODUCTION** /
+    **ALIEH_USE_BUSINESS_DB**, entre outros (ver funções em connection e
+    app_auth).
+
+  2.4 Perfis (RBAC parcial)
+  - Coluna **users.role** (`admin`, `operator`, …); sessão **alieh_auth_role**.
+  - **`require_role(ROLE_ADMIN)`** em **app.py** (amostragem de linhas ~952,
+    ~1638, ~2078, ~2563, ~2777): ações sensíveis exigem admin quando o login
+    está configurado; modo dev sem auth configurada não aplica gate (comportamento
+    documentado em **require_role**).
+
+  2.5 Anti brute-force de login
+  - **Repositório:** **database/login_throttle_repo.py** — constantes compartilhadas
+    com **app_auth**: **5** falhas consecutivas, bloqueio **300 s**.
+  - **Persistência:** tabela **login_user_throttle** com chave **(tenant_id,
+    username_norm)**; contagem e `locked_until` partilhados entre sessões e
+    clientes que usam a mesma BD.
+  - **Plano B:** se a BD falhar ao atualizar throttle, **fallback** em
+    **st.session_state** espelha a mesma política (**_session_fallback_*** em
+    **app_auth.py**).
+  - **Auditoria de tentativas:** **login_attempt_audit** (INSERT em sucesso e
+    falha; colunas incluem **tenant_id**, **username_norm**, **success**,
+    **created_at**, **client_hint** opcional derivado de cabeçalhos proxy quando
+    disponíveis).
+
+  2.6 Registo de eventos de negócio (ficheiro)
+  - **utils/critical_log.py** — **append-only**, cadeia **audit_prev** /
+    **audit_chain**, opcional **HMAC** com **ALIEH_LOG_CHAIN_SECRET**;
+    **verify_audit_log_file()** para verificação off-line.
+
+  2.7 Preparação multi-tenant (sem alterar uso atual)
+  - **DEFAULT_TENANT_ID = "default"**; **`resolve_tenant_id`** normaliza `None`/vazio.
+  - Migração única **tenant_multitenant_v1** (**database/tenant_migrate.py**):
+    coluna **tenant_id** e, onde aplicável, reconstrução de chaves (contadores,
+    **users**, **customers**, **login_user_throttle**).
+  - **Comportamento atual:** toda a dados legada e chamadas sem argumento ficam no
+    inquilino **default**; a UI **não** escolhe inquilino — evolução SaaS exigiria
+    tenant na sessão e propagação aos serviços/repositórios.
+
+  2.8 Cópias periódicas de auditoria
+  - **utils/audit_backup.maybe_run_periodic_audit_backup()** — cópia de
+    **logs/app.log** e export JSON das tabelas **login_attempt_audit**,
+    **sku_deletion_audit**, **price_history** para **audit_backups/** (com
+    espelho opcional); intervalo e caminhos configuráveis (secção 13).
+
+  2.9 O que não está fechado como RBAC de dados / SaaS completo
+  - Não há isolamento de dados por utilizador da app (apenas por **tenant_id**
+    preparado no schema com um único valor efetivo).
+  - **sku_master** mantém **PRIMARY KEY (sku)**; o mesmo texto SKU em dois
+    inquilinos futuros exigiria novo desenho de chave.
+  - **require_role** não cobre necessariamente 100% dos controlos da UI (amostrar
+    app.py nas áreas críticas da organização).
+
+
+--------------------------------------------------------------------------------
+3. SEQUÊNCIA DE ARRANQUE E DEPENDÊNCIAS
+--------------------------------------------------------------------------------
+
+  3.1 Ordem em **app.py** (`main`)
+  - Ver secção 2.1; evidência direta: primeiras linhas da função **main**.
+
+  3.2 Ordem crítica em **init_db()** (multi-tenant vs legado)
+  - Em bases **antigas**, `CREATE TABLE IF NOT EXISTS` **não** adiciona colunas
+    novas a tabelas já existentes. O código deve aplicar **migrate_multitenant_prepare**
+    **antes** de:
+      • `INSERT` em contadores com colunas **(tenant_id, id, last_value)**;
+      • `CREATE INDEX` ou outras operações que assumem **tenant_id** em
+        **customers**, **users**, etc.
+  - Implementação atual (**database/init_db.py**): criação dos três contadores
+    (**sku_sequence_counter**, **customer_sequence_counter**,
+    **sale_sequence_counter**); em seguida **`migrate_multitenant_prepare(conn)`**;
+    depois **`INSERT OR IGNORE`** nas três tabelas; só então **customers**,
+    **users**, índices compostos com **tenant_id**, etc.
+  - Falha típica corrigida por esta ordem: **OperationalError: no column
+    tenant_id** em contadores ou índices sobre **customers** legado.
+  - Outras migrações (ex.: **inventory_decimal_v1** em **database/migrations.py**)
+    podem recriar tabelas sem **tenant_id**; a migração multi-tenant posterior
+    adiciona **tenant_id** por **ALTER** ou reconstrução — o auditor deve validar
+    uma cópia da BD real após **primeiro** arranque pós-atualização.
+
+
+--------------------------------------------------------------------------------
+4. AUTENTICAÇÃO — DETALHE TÉCNICO
+--------------------------------------------------------------------------------
+
+  4.1 Ficheiro central
+  - **utils/app_auth.py** (docstring no topo resume modos legacy vs BD).
+
+  4.2 Variáveis de ambiente e secrets (legacy)
+  - **ALIEH_AUTH_USERNAME**, **ALIEH_AUTH_PASSWORD** (preferência sobre secrets).
+  - Streamlit Secrets: **auth_username** / **auth_password** ou **[auth]**.
+  - Opcional: **ALIEH_AUTH_USER_ID** — identificador em logs quando não há
+    correspondência com **users.id**.
+
+  4.3 Estado de sessão Streamlit (chaves principais)
+  - **alieh_auth_ok**, **alieh_auth_username**, **alieh_auth_user_id**,
+    **alieh_auth_role**
+  - Throttle fallback: **alieh_login_failures_by_user**,
+    **alieh_login_locked_until_by_user** (estrutura por utilizador normalizado).
+
+  4.4 Funções de decisão (amostra)
+  - **is_production_environment()**, **is_auth_configured()**,
+    **legacy_configured_but_superseded_by_db()**
+
+  4.5 Fluxo **try_login** (simplificado)
+  - Com linhas em **users**: **fetch_user_by_username** + **verify_password**
+    (**utils/password_hash.py**), tenant **default**.
+  - Sem linhas em **users**, com legacy válida: **secrets.compare_digest**;
+    perfil pode vir de linha homónima em **users** ou **admin** + user_id de
+    config em deploy legacy puro.
+
+  4.6 Throttle no fluxo de formulário
+  - Antes de validar password: **_throttle_user_is_locked** consulta SQLite
+    (**refresh_and_is_locked**) e compõe com lock de sessão se ambos ativos.
+  - Falha de password: **_throttle_record_failure** → **record_failed_attempt**
+    + limpeza de chaves de fallback + **log_attempt** (falha).
+  - Sucesso: **_throttle_clear_success** → **clear_for_user** +
+    **log_attempt** (sucesso).
+
+  4.7 Logout
+  - Remove chaves de autenticação, role e dicionários de throttle em sessão.
+
+  4.8 **require_role(role)**
+  - Se auth não configurada: no-op (dev aberto).
+  - Se autenticado e role ≠ exigido: **format_access_requires_role** + **st.stop()**.
+
+
+--------------------------------------------------------------------------------
+5. BASE DE DADOS — USERS, TENANT E GESTÃO DE SENHAS
+--------------------------------------------------------------------------------
+
+  5.1 Schema **users** (instalações novas / pós-migração)
+  - Colunas incluem **tenant_id** (TEXT NOT NULL, default **default**),
+    **username** (NOCASE), **password_hash**, **created_at**, **role**;
+    **UNIQUE(tenant_id, username)**; índice **idx_users_tenant_username**.
+
+  5.2 Migração legado → multi-tenant
+  - **tenant_migrate._migrate_users**: renomeia tabela, recria com **tenant_id**,
+    copia dados com **DEFAULT_TENANT_ID**.
+
+  5.3 Repositório
+  - **database/user_repo.py**: **count_users**, **fetch_user_by_username**,
+    **insert_user** (inclui **tenant_id** opcional, **resolve_tenant_id**).
+
+  5.4 Derivação de palavra-passe
+  - **utils/password_hash.py**: PBKDF2-HMAC-SHA256 (ordem de grandeza 390k
+    iterações — confirmar no ficheiro para auditoria pontual).
+
+  5.5 Provisioning
+  - **scripts/create_alieh_user.py**: cria utilizador interativo na BD.
+
+
+--------------------------------------------------------------------------------
+6. LIMITAÇÃO DE TENTATIVAS E AUDITORIA DE LOGIN (SQLite)
+--------------------------------------------------------------------------------
+
+  6.1 Constantes
+  - **MAX_FAILURES_BEFORE_LOCKOUT = 5**, **LOCKOUT_SECONDS = 300** —
+    **login_throttle_repo.py** (importadas em **app_auth**).
+
+  6.2 Tabela **login_user_throttle**
+  - Chave primária **(tenant_id, username_norm)**; campos **failure_count**,
+    **locked_until** (epoch real), **updated_at** (ISO UTC).
+
+  6.3 Tabela **login_attempt_audit**
+  - Um INSERT por tentativa registada via **log_attempt** (sucesso ou falha).
+  - Proteção de imutabilidade: triggers **BEFORE DELETE/UPDATE** com
+    **RAISE(ABORT, ...)** em **init_db** (mensagens em português).
+
+  6.4 Julgamento para o auditor
+  - Obrigatório **não confundir** com rate-limit por IP: o desenho é **por
+    nome de utilizador normalizado** na BD + fallback de sessão.
+  - Várias origens a partilharem o mesmo URL da app serão **atenuadas** pela BD
+    comum; não substitui WAF ou política de rede.
+
+
+--------------------------------------------------------------------------------
+7. REGISTO DE AUDITORIA EM FICHEIRO (critical_log)
+--------------------------------------------------------------------------------
+
+  7.1 Ficheiro e módulo
+  - **utils/critical_log.py**; caminhos consultáveis via **critical_audit_log_path()**
+    (usado também por **audit_backup**).
+
+  7.2 Modo de escrita
+  - **FileHandler**, modo **'a'**; sem rotação interna que apague histórico.
+
+  7.3 Forma canónica da linha
+  - **audit_prev**, **audit_chain**, payload com **action=**, **user=**,
+    **user_id=**, campos adicionais ordenados conforme implementação.
+
+  7.4 Cadeia e HMAC
+  - Ver relatório anterior (SHA-256 vs HMAC com **ALIEH_LOG_CHAIN_SECRET**);
+    continuidade após restart lendo cauda do ficheiro.
+
+  7.5 Concorrência e verificação
+  - Lock em thread; **verify_audit_log_file** para integridade off-line.
+
+  7.6 Limitações
+  - Portador do segredo HMAC + escrita pode forjar cadeia nova; controlo de
+    acesso ao SO e segregação de funções são externos ao código.
+
+  7.7 Eventos de negócio (amostragem de código)
+  - **log_critical_event** / **log_critical_event_payload**: pesquisar em
+    **services/**, **database/sku_corrections.py** e ficheiros de escrita de
+    produtos/vendas.
+  - **STOCK_MANUAL_WRITE_DOWN** — disparado por **apply_manual_stock_write_down**
+    (**services/product_service.py**) após transacção bem sucedida de baixa
+    manual; campos típicos no payload incluem **product_id**, **quantity**,
+    **stock_after**, **user_id** (quando a sessão fornece identificador de
+    auditoria). Não duplicar com vendas: não há **sale_recorded** nem **sale_code**
+    associado a este evento.
+
+
+--------------------------------------------------------------------------------
+8. AUDITORIA E IMUTABILIDADE EM TABELAS SQLite
+--------------------------------------------------------------------------------
+
+  8.1 Tabelas com trilho de auditoria / histórico relevante
+  - **login_attempt_audit** — tentativas de login (INSERT apenas na prática;
+    triggers impedem UPDATE/DELETE).
+  - **sku_deletion_audit** — exclusões de SKU (imutabilidade por triggers).
+  - **price_history** — histórico de preços (exportado pelo backup periódico;
+    integridade lógica depende da aplicação).
+
+  8.2 Triggers
+  - Definidos em **database/init_db.py** (nomes **tr_login_attempt_audit_***,
+    **tr_sku_deletion_audit_***).
+
+  8.3 Export para fora da BD
+  - **audit_backup** serializa as três tabelas acima para JSON junto com cópia
+    do ficheiro de log nomeado com timestamp.
+
+
+--------------------------------------------------------------------------------
+9. PREPARAÇÃO MULTI-TENANT (SaaS — fase de schema)
+--------------------------------------------------------------------------------
+
+  9.1 Módulos
+  - **database/tenancy.py** — **DEFAULT_TENANT_ID**, **resolve_tenant_id**.
+  - **database/tenant_migrate.py** — **migrate_multitenant_prepare(conn)**;
+    idempotente; registo em **app_schema_migrations** com id
+    **tenant_multitenant_v1**.
+
+  9.2 Efeitos da migração (resumo)
+  - **ALTER** com **tenant_id TEXT NOT NULL DEFAULT 'default'** onde aplicável:
+    products, sales, stock_cost_entries, price_history, sku_master,
+    sku_pricing_records, sku_cost_components, sku_deletion_audit,
+    login_attempt_audit (se existir).
+  - Reconstrução de contadores (**sku_sequence_counter**,
+    **sale_sequence_counter**, **customer_sequence_counter**) para PK composta
+    **(tenant_id, id)** com **id = 1** fixo por inquilino.
+  - Reconstrução **users**, **customers**, **login_user_throttle** com unicidade
+    composta envolvendo **tenant_id**.
+
+  9.3 Propagação no código
+  - Repositórios e serviços aceitam **tenant_id=None** com resolução para
+    **default**; queries de leitura/escrita devem filtrar por **tenant_id**
+    onde implementado (auditor: amostrar **database/queries.py** — delegação a
+    **repositories/query_repository** —, **sales_repo**, **customer_repo**,
+    **product_write_repo**, **sku_codec**, etc.).
+  - Camada apresentada à UI: **services.read_queries** reexporta as funções de
+    leitura usadas por **app.py**, **painel_dashboard** e **analytics/metrics**;
+    **services.tenant_scope** expõe **effective_tenant_id_for_request** sem a
+    app importar **database.tenancy** directamente.
+
+  9.4 Limitações explícitas para modelo SaaS completo
+  - **sku_master** permanece com **PRIMARY KEY (sku)** — colisão cross-tenant
+    pelo mesmo texto **sku** não está resolvida ao nível de PK.
+  - Sessão e login não carregam **tenant_id** dinâmico; todas as rotinas de auth
+    de negócio observadas usam **DEFAULT_TENANT_ID**.
+
+
+--------------------------------------------------------------------------------
+10. init_db E MIGRAÇÕES VERSIONADAS (app_schema_migrations)
+--------------------------------------------------------------------------------
+
+  10.0 Ponto de entrada na aplicação
+  - **app.py** invoca **`run_database_init()`** (**services/db_startup.py**), que
+    por sua vez importa e executa **`init_db()`**. O comportamento de schema
+    descrito abaixo mantém-se em **database/init_db.py**; apenas o *call* da UI
+    foi deslocado para a fachada de serviços.
+
+  10.1 Tabela de controlo
+  - **app_schema_migrations (id TEXT PRIMARY KEY)** — utilizada por
+    **tenant_migrate** e por **migrate_inventory_decimal_v1** (id
+    **inventory_decimal_v1**) em **database/migrations.py**.
+
+  10.2 Risco de migração “marcada mas incompleta”
+  - Se o processo morrer após INSERT do id e antes de concluir alterações, o
+    estado pode ficar inconsistente — procedimento operacional: restaurar backup
+    ou intervenção manual com supervisão técnica.
+
+  10.3 Outras rotinas em **init_db**
+  - **sync_sale_sequence_counter_from_sales**, **sync_sku_sequence_counter_from_skus**,
+    **sync_customer_sequence_counter_from_customers**, backfills de COGS / sku_master,
+    **migrate_product_skus_to_generated**, **migrate_sku_cost_component_rows**, etc.
+  - O auditor deve mapear a BD real à ordem de execução lendo **init_db.py** na
+    íntegra (ficheiro longo, ~500+ linhas).
+
+
+--------------------------------------------------------------------------------
+11. CAMADA DE SERVIÇOS, REPOSITÓRIOS E user_id
+--------------------------------------------------------------------------------
+
+  11.1 Padrão
+  - **database/repositories/** e *shims* **database/*_repo.py** concentram SQL
+    parametrizado e **db_execute** (camada de repositório).
+  - **services/*.py** orquestra regras de negócio e chama **log_critical_event**
+    com **user_id** opcional; **get_audit_session_user_id** / username em
+    **app_auth** fornecem contexto quando a UI não passa id explicitamente.
+  - **app.py** não deve importar **`database.*`** para consultas ou gravações:
+    usar **customer_service**, **product_service**, **sales_service** e as
+    fachadas listadas em 11.3.
+
+  11.2 Ligação à BD
+  - **get_conn()** em **database/connection.py**: **row_factory** Row,
+    **PRAGMA foreign_keys = ON**.
+  - **get_db_conn()** (SQLite ou Postgres conforme configuração) deve ficar
+    confinado à implementação em **database/** (repositórios, **init_db**,
+    **sqlite_export**, etc.); testes podem *patchar* por conveniência.
+  - **database/transactions.py**: padrão BEGIN/COMMIT para operações atómicas
+    onde utilizado.
+
+  11.3 Fachadas **services/** para a UI (Abril 2026)
+  - **services/read_queries** — consultas só leitura delegadas a
+    **database.queries** (repositório **query_repository**).
+  - **services/tenant_scope** — **effective_tenant_id_for_request** (delega
+    **database.tenancy**).
+  - **services/db_startup** — **run_database_init** → **init_db**.
+  - **services/sqlite_admin** — **get_sqlite_db_path** (caminho do ficheiro
+    SQLite para operações administrativas na UI).
+  - **services/uat_checklist_service** — constantes e persistência UAT (delega
+    **database.uat_checklist_repo** / repositório).
+  - **services/domain_constants** — constantes partilhadas com formulários
+    (delega **database.constants**).
+  - **services/product_lot_facade** — corpo SKU, imagens de lote, edição de
+    lote, exclusão dura de catálogo (delega **database.product_edit**,
+    **product_images**, **sku_codec**, **sku_corrections** — estes módulos são
+    por sua vez delegados a repositórios onde aplicável).
+  - **Nota para amostragem:** **utils/app_auth.py**, **utils/audit_backup.py** e
+    **utils/validators.py** ainda referenciam **database.*** (autenticação,
+    export de tabelas de auditoria, lista de métodos de pagamento para
+    validação). Isto é aceitável como infra-estrutura transversal até eventual
+    extracção para serviços dedicados; **app.py** em si permanece isolado.
+
+  11.4 Baixa manual de stock (persistência e auditoria)
+  - **Repositório:** **database/repositories/product_repository.py** —
+    função **decrement_product_stock_manual(conn, product_id, quantity,
+    tenant_id=None)**.
+  - **Validações:** quantidade estritamente positiva; linha **products** existente;
+    **deleted_at** nulo (lote activo); stock disponível ≥ quantidade (tolerância
+    numérica **\_STOCK_DEC_EPS**); **UPDATE** com **rowcount == 1**.
+  - **Efeito na BD:** único **UPDATE** em **products.stock**; **cost**, **price**,
+    **pricing_locked** e restantes colunas do lote **não** são alteradas pela
+    baixa manual. Em seguida **sync_sku_master_totals** (**sku_master_repo**) para
+    o **sku** do lote (se SKU vazio, a sincronização do mestre é no-op pelo
+    próprio **sync**; o stock do lote continua correcto em **products**).
+  - **Serviço:** **services/product_service.py** —
+    **apply_manual_stock_write_down(product_id, quantity, *, user_id, tenant_id)**:
+    envolve **write_transaction** e chama **decrement_product_stock_manual**;
+    regista **log_critical_event("STOCK_MANUAL_WRITE_DOWN", user_id=...,
+    product_id=..., quantity=..., stock_after=...)**.
+  - **Separação de trilhos:** a baixa manual **não** insere linha em **sales**,
+    **não** gera **sale_code**, **não** altera CMP nem histórico de entradas de
+    custo — distingue-se assim da venda registada (**sales_service.record_sale**).
+  - **Testes:** **tests/test_manual_stock_write_down.py** valida os invariantes
+    acima em base SQLite temporária com **init_db** e seed mínimo de **products** +
+    **sku_master**.
+
+
+--------------------------------------------------------------------------------
+11A. PÁGINA «ESTOQUE» — DATA GRID, FILTROS, RODAPÉ E EXCLUSÃO DE LOTE
+--------------------------------------------------------------------------------
+
+  11A.1 Âmbito e RBAC
+  - Constante de navegação **PAGE_ESTOQUE** em **app.py**; ramo **elif page ==
+    PAGE_ESTOQUE:** antecedido por **require_admin()** — toda a página **Estoque**
+    fica reservada a **administrador** quando autenticação está activa (paridade
+    com **Precificação** e política documentada na matriz A.3 do UAT).
+  - **Rastreio de código (snapshot do ramo principal; números de linha podem
+    deslocar-se após refactors — revalidar com `rg "PAGE_ESTOQUE" app.py`):**
+    em **app.py** aprox. **linhas 2664–2665** — `elif page == PAGE_ESTOQUE:` e
+    chamada imediata a **`require_admin()`** antes de qualquer conteúdo da página.
+
+  11A.2 Fonte de dados e preparação de linhas
+  - **fetch_products()** (via **services.read_queries** na app) sobre **products**
+    com **deleted_at IS NULL**; filtro **in_stock_products**: produtos com
+    **stock > 0** (comparação em float).
+  - Estrutura **items** (lista de dicts por lote): **product_id**, **code**
+    (**product_enter_code**), **name**, **sku**, atributos de vitrine (**frame_color**,
+    **lens_color**, **style**, **palette**, **gender**), **cost**, **price**,
+    **markup** (preço − custo, arredondado), **stock_qty** (int, para filtros e
+    totais legados), **stock_val** (float do **REAL** em BD para exibição com 4
+    decimais na grelha), **registered_date**.
+
+  11A.3 Cabeçalho de filtros (inalterado em lógica)
+  - Grelha de **12** colunas **st.columns** com pesos **stock_col_w**; linha 0:
+    rótulos **Ação**, **Nome do produto**, **SKU**, … **Em estoque**.
+  - Em cada coluna (excepto coluna **Ação**, sem multiselect): **st.multiselect**
+    com chaves estáveis **stock_filter_*** ; filtro conjuntivo — uma linha só
+    aparece se pertencer à intersecção de todos os critérios seleccionados
+    (lista vazia num filtro = “qualquer”).
+  - Comportamento esperado para auditoria: combinações de multiselect não enviam
+    SQL dinâmico da UI; a lista **filtered** é construída em Python sobre **items**.
+
+  11A.4 Ordenação e tabela principal (Data Grid Streamlit)
+  - **st.selectbox** «Ordenar por» com chave **estoque_inv_sort_by** e opções
+    **sku**, **name**, **stock_desc**, **stock_asc** (rótulos humanos alinhados à
+    busca de produtos). Ordena a lista **filtered** **in-place** antes de montar o
+    **pandas.DataFrame**.
+  - **st.dataframe** com:
+      • **column_order**: ordem canónica das 11 colunas visíveis (sem colunas
+        internas **_pid** — não são necessárias porque o índice da linha na
+        DataFrame coincide com a posição em **filtered** após ordenação);
+      • **column_config**: **Custo**, **Preço de venda**, **Margem** com
+        **NumberColumn** `%.2f`; **Em estoque** com `%.4f`;
+      • **on_select="rerun"**, **selection_mode="single-row"**,
+        **key="estoque_inventory_data_grid"**.
+  - Valores monetários na célula são **numéricos** (não texto «R$»), no mesmo
+    padrão que **Produtos → Busca por SKU**; o rodapé mantém **format_money**
+    para totais (ver 11A.5).
+
+  11A.5 Linha «TOTAL GERAL» (cálculos invariantes)
+  - Sobre a mesma lista **filtered** **após** ordenação (o mesmo conjunto de linhas
+    que alimenta o DataFrame):
+      • **totals_cost += cost × stock_qty**
+      • **totals_price += price × stock_qty**
+      • **totals_markup += markup × stock_qty**
+      • **totals_stock += stock_qty** (inteiro por linha, como antes da migração
+        para DataFrame).
+  - Renderização do rodapé: nova linha **st.columns(stock_col_w)** com
+    **TOTAL GERAL** na coluna do nome, células vazias nas colunas de atributos,
+    e **format_money** / valor inteiro de **totals_stock** nas quatro últimas
+    colunas — o auditor pode confrontar com soma manual em amostra.
+
+  11A.6 Exclusão de lote a partir da grelha
+  - **st.caption** explica o fluxo em duas etapas (selecção + botão).
+  - **st.button** «Excluir lote selecionado» (**key=estoque_exclude_from_grid_selection**):
+    lê **\_stock_grid_state.selection.rows** (retorno de **st.dataframe** com
+    selecção activa); se vazio → **st.error**; senão usa **filtered[ridx]** para
+    **product_enter_code** e monta **pending_exclude_label** textual (nome,
+    atributos, SKU, código) — **mesmo formato lógico** que o antigo botão por linha.
+  - Estado de diálogo: **st.session_state.pending_exclude_code** /
+    **pending_exclude_label**; **@st.dialog** **confirm_exclude_dialog** chama
+    **reset_batch_pricing_and_exclude(code)** após confirmação (comportamento de
+    negócio **inalterado**).
+
+  11A.7 Baixa manual (UI) — referência cruzada e linhas em app.py
+  - Contexto: mesmo ramo **PAGE_ESTOQUE** que **11A.1**; o expander situa-se
+    **acima** do **st.divider** que precede os filtros multiselect e a grelha
+    **estoque_inventory_data_grid** (fluxo: baixa opcional → depois inventário).
+  - **Detalhe de implementação (snapshot ~Abril 2026):**
+      • **~L2910:** `st.expander("Baixa manual de estoque", expanded=False)`.
+      • **~L2905–2908:** inicialização **`stock_baixa_form_nonce`** em
+        **session_state** e construção da chave dinâmica do checkbox de confirmação
+        (`stock_baixa_confirm_checkbox_{nonce}`) — ver glossário **stock_baixa_form_nonce**.
+      • **~L2948–2953:** **st.selectbox** do lote (**key=stock_manual_baixa_select**),
+        opções derivadas de lotes activos com stock > 0.
+      • **~L2962–2969:** **st.number_input** «Quantidade a dar baixa»
+        (**key=stock_manual_baixa_qty**), limitado ao máximo do lote seleccionado.
+      • **~L2977–2984:** checkbox de confirmação irreversível e botão «Aplicar baixa
+        de estoque» (**key=stock_manual_baixa_aplicar**).
+      • **~L2985–2999:** validações (confirmação marcada, quantidade > 0, ≤ stock);
+        em sucesso chama **`apply_manual_stock_write_down`** (import de
+        **services.product_service**).
+      • **~L3006–3007:** incremento de **`stock_baixa_form_nonce`** após baixa
+        bem sucedida para forçar novo widget de checkbox (API Streamlit).
+  - Persistência, SQL, **STOCK_MANUAL_WRITE_DOWN** e separação face a **sales:**
+    **§11.4**.
+
+  11A.8 Evidências recomendadas para walkthrough
+  - [ ] Gravar vídeo ou sequência de capturas: filtro multiselect + ordenação +
+        selecção de linha + exclusão com diálogo.
+  - [ ] Gravar: expander de baixa + checkbox + sucesso + verificação de stock em
+        **Custos** ou nova leitura de **products**.
+  - [ ] Executar **pytest tests/test_manual_stock_write_down.py -v** e anexar
+        output ao dossiê.
+
+
+--------------------------------------------------------------------------------
+12. BACKUP DE BASE DE DADOS E EXPORT “ADMIN”
+--------------------------------------------------------------------------------
+
+  12.1 Export SQLite na sidebar
+  - **app.py** — função **\_maybe_sidebar_database_export**: só se Secret
+    **allow_database_export** ativo; o caminho do ficheiro obtém-se via
+    **services.sqlite_admin.get_sqlite_db_path()** (sem **database.connection.DB_PATH**
+    directo no **app.py**). Documentação pede desligar o secret após uso
+    (ver também RELATORIO_SEGURANCA_AUDITOR.txt).
+
+  12.2 Diferença face a **audit_backup**
+  - **audit_backup** não substitui backup completo da BD: copia **app.log** e
+    extrai tabelas de auditoria/histórico selecionadas para JSON.
+
+
+--------------------------------------------------------------------------------
+13. TABELA DE VARIÁVEIS DE AMBIENTE E SECRETS RELEVANTES
+--------------------------------------------------------------------------------
+
+  Variável / Secret (exemplos)     | Uso resumido
+  ----------------------------------+------------------------------------------
+  ALIEH_ENV                         | Ambiente (ex.: production)
+  ALIEH_PRODUCTION / USE_BUSINESS_DB | Forçar business.db
+  ALIEH_SQLITE / sqlite_filename     | Nome do ficheiro SQLite em dev
+  DB_PROVIDER / DATABASE_URL / SUPABASE_DB_URL | Motor e DSN Postgres (ver database.config)
+  DATABASE_CONNECT_TIMEOUT           | Segundos — timeout de ligação Postgres (psycopg)
+  DATABASE_HEALTH_INTERVAL_SECONDS   | >0 — período entre `check_database_health` na app (reruns)
+  ALIEH_SKIP_POSTGRES_STARTUP_PROBE  | Desactiva thread `test_postgres_connection` no arranque
+  ALIEH_AUTH_USERNAME / PASSWORD    | Legacy
+  ALIEH_AUTH_USER_ID                | Id opcional em logs (sem users)
+  ALIEH_LOG_CHAIN_SECRET            | HMAC da cadeia em critical_log
+  ALIEH_AUDIT_BACKUP_INTERVAL_SECONDS | Intervalo mínimo entre cópias
+  ALIEH_AUDIT_BACKUP_DIR            | Pasta audit_backups (alternativa a default)
+  ALIEH_AUDIT_EXPORT_DIR / secrets  | Espelho opcional (ex.: pasta de rede)
+  ALIEH_AUDIT_BACKUP_DISABLED       | Desliga maybe_run_periodic_audit_backup
+  allow_database_export             | Secret Streamlit — download SQLite na UI
+
+  Lista orientadora: **.streamlit/secrets.toml.example**.
+
+
+--------------------------------------------------------------------------------
+14. MATRIZ RISCO × CONTROL × LACUNA (SÍNTESE)
+--------------------------------------------------------------------------------
+
+  Tema                      | Controlo no código              | Lacuna / nota
+  --------------------------+---------------------------------+--------------------------------
+  Acesso à app              | Legacy ou users + produção exige auth | MFA externo; URL partilhada
+  Colisão legacy vs BD      | BD prevalece; aviso UI          | Limpar env/secrets obsoletos
+  Brute force login         | SQLite por user + fallback sessão | Não é rate-limit por IP
+  Perfis UI                 | require_role(ADMIN) em pontos  | Amostrar todas as ações críticas
+  Integridade log ficheiro  | append + cadeia + verify_*      | Proteção do ficheiro no SO
+  Segregação multi-tenant | Coluna tenant_id + migração     | Um tenant efetivo; PK sku_master
+  Imutabilidade audit tables | Triggers ABORT UPDATE/DELETE | Não cobre todas as tabelas
+  Retenção / arquivo        | Crescimento de logs e JSON      | Política operacional externa
+  Export BD                 | Secret explícito allow_*        | Quem pode ativar o secret
+  Baixa manual (sem venda)  | Transacção + STOCK_MANUAL_*     | Sem **sales**/CMP; contrastar trilhos
+  Alcançabilidade Supabase   | health_check + silent_probe     | Não substitui smoke em staging; logs sem DSN
+
+
+--------------------------------------------------------------------------------
+15. CHECKLIST DE EVIDÊNCIAS (AMOSTRAGEM SUGERIDA)
+--------------------------------------------------------------------------------
+
+  [ ] app.py — ordem: run_database_init → register_sqlite_full_backup_atexit →
+      run_startup_sqlite_full_backup_once → maybe_run_periodic_maintenance_backups →
+      maybe_run_periodic_database_health → ensure_authenticated_or_stop  
+      (em **run_database_init**: `init_db` → `check_database_health` →
+      **schedule_postgres_connectivity_probe_on_startup** — probe Postgres em background)
+  [ ] **database/connection.py** — **check_database_health**; **get_postgres_conn(..., silent_probe=)**;
+      **DATABASE_HEALTH_INTERVAL_SECONDS** opcional
+  [ ] **database/health_check.py** — **test_postgres_connection**, thread no arranque, CLI `python -m database.health_check`
+  [ ] **tests/test_database_config.py**, **test_database_health.py**, **test_postgres_probe.py** —
+      execução pytest (roteiro em RELATORIO_COMPLETO_CODIGO_E_TESTES.txt §13)
+  [ ] app.py — sem imports **from database** / **import database** (fachadas em
+      **services/**)
+  [ ] app.py — ocorrências de require_role(ROLE_ADMIN) alinhadas à política
+  [ ] utils/app_auth.py — try_login, throttle DB + fallback, log_attempt
+  [ ] database/login_throttle_repo.py — constantes e SQL
+  [ ] database/init_db.py — ordem: contadores → migrate_multitenant_prepare →
+      INSERT contadores → customers/users/índices; triggers de auditoria
+  [ ] database/tenant_migrate.py — id tenant_multitenant_v1 e lista de tabelas
+  [ ] database/tenancy.py — DEFAULT_TENANT_ID
+  [ ] database/user_repo.py — filtro tenant_id em fetch
+  [ ] utils/critical_log.py — verify_audit_log_file após alteração maliciosa
+  [ ] utils/audit_backup.py — _AUDIT_TABLES e estado .audit_backup_state.json
+  [ ] services/* — fachadas (read_queries, tenant_scope, db_startup, sqlite_admin,
+      uat_checklist_service, domain_constants, product_lot_facade, customer/product/sales)
+      e amostra de log_critical_event (incl. **database/sku_corrections.py** onde aplicável)
+  [ ] .streamlit/secrets.toml.example
+  [ ] scripts/create_alieh_user.py
+  [ ] Cópia da BD de produção (teste): primeiro arranque pós-deploy — PRAGMA
+      table_info nas tabelas listadas na secção 9.2
+  [ ] **app.py** ramo **PAGE_ESTOQUE** — DataFrame **estoque_inventory_data_grid**,
+      ordenação, multiselects, rodapé TOTAL GERAL, botão exclusão com diálogo
+  [ ] **services/product_service.py** — **apply_manual_stock_write_down** e
+      evento **STOCK_MANUAL_WRITE_DOWN**
+  [ ] **database/repositories/product_repository.py** —
+      **decrement_product_stock_manual** (SQL e **sync_sku_master_totals**)
+  [ ] **tests/test_manual_stock_write_down.py** — execução pytest e revisão dos
+      invariantes (custo/preço, mestre, erros)
+
+
+--------------------------------------------------------------------------------
+16. GLOSSÁRIO
+--------------------------------------------------------------------------------
+
+  Live / produção — combinação de caminho Cloud, env e flags em connection/auth.
+  Legacy — par único env/secrets; só usado se **users** vazio.
+  tenant_id — identificador de inquilino lógico; hoje efetivamente único.
+  DEFAULT_TENANT_ID — literal **default** em código.
+  resolve_tenant_id — normalização de argumento omitido ou vazio.
+  verify_audit_log_file — verificador de cadeia no ficheiro de log.
+  maybe_run_periodic_audit_backup — cópias periódicas de artefactos de auditoria.
+  maybe_run_periodic_maintenance_backups — orquestra auditoria periódica e tarefas
+    de manutenção de backup declaradas em **audit_backup**.
+  run_database_init — ponto de entrada da app para **init_db** + **check_database_health** +
+    **schedule_postgres_connectivity_probe_on_startup** via **services/db_startup**.
+  check_database_health — **SELECT 1** sobre o motor activo; fallback SQLite se Postgres
+    automático falhar (paridade com **get_db_conn**).
+  test_postgres_connection — probe isolado Supabase/Postgres (``silent_probe``); não altera o motor principal.
+  schedule_postgres_connectivity_probe_on_startup — agenda **test_postgres_connection** em thread daemon.
+  baixa manual de stock — redução directa de **products.stock** sem linha em
+    **sales**, via **decrement_product_stock_manual** / **apply_manual_stock_write_down**.
+  Data Grid (UI Streamlit) — **st.dataframe** com ordenação por cabeçalho de
+    coluna no cliente, **column_config**, e opcionalmente **on_select** para
+    selecção de linhas (página **Estoque**).
+  stock_baixa_form_nonce — contador em **st.session_state** para renovar a chave
+    do widget de confirmação da baixa após sucesso (evita **StreamlitAPIException**).
+
+
+--------------------------------------------------------------------------------
+17. COMANDOS DE VERIFICAÇÃO RÁPIDA (AMBIENTE DO AUDITOR)
+--------------------------------------------------------------------------------
+
+  Os comandos assumem diretório de trabalho = raiz do repositório
+  (`…\ALIEH management`) e Python com dependências de **requirements.txt**
+  instaladas.
+
+  - **Contagem da suíte pytest (esperado: 75 testes recolhidos; 78 com integração opcional):**
+        python -m pytest --collect-only -q
+
+  - **Configuração, saúde e probe Postgres:**
+        python -m pytest tests/test_database_config.py tests/test_database_health.py tests/test_postgres_probe.py -v
+
+  - **Probe Postgres manual (`.env` na raiz ou DSN no ambiente):**
+        python -m database.health_check
+
+  - **Baixa manual de stock (5 testes, invariantes de repositório/serviço):**
+        python -m pytest tests/test_manual_stock_write_down.py -v
+
+  - **Suíte completa (regressão; excluir integração Postgres se necessário):**
+        python -m pytest tests/ -q --ignore=tests/test_postgres_integration.py
+
+  - **«app.py sem database» — ausência de imports directos do pacote database
+    na UI principal** (resultado esperado: nenhuma linha de import ao nível do
+    módulo; usar **ripgrep** (`rg`), **git grep**, busca na IDE ou, no PowerShell:
+    `Select-String -Path app.py -Pattern '^from database\\.|^import database(\\s|$)'`).
+
+  - **Ocorrências da página Estoque e do nonce de baixa (localizar blocos):**
+    mesmas ferramentas, padrão sugerido:
+    `PAGE_ESTOQUE|stock_baixa_form_nonce|apply_manual_stock_write_down`
+
+
+================================================================================
+Fim do relatório técnico para auditoria
+================================================================================

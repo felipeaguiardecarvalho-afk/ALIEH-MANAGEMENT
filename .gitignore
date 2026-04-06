@@ -1,7 +1,21 @@
 node_modules/
+
+# Secrets and env (never commit real values)
 .env
+.env.local
+.env.*.local
+!.env.example
 .streamlit/secrets.toml
 __pycache__/
+
+# Dados sensíveis — não versionar (SQLite, volumes de deploy, cópias locais)
 *.db
 *.sqlite
 *.sqlite3
+/data/
+/backups/
+/logs/
+
+# Pastas de dados da app (raiz do repositório)
+audit_backups/
+product_images/

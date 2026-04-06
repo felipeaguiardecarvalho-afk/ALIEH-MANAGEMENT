@@ -1,37 +1,130 @@
 import json
 import logging
 import math
-import re
-import sqlite3
+import os
+from pathlib import Path
 import urllib.error
 import urllib.parse
 from urllib import request
-from datetime import datetime
-from typing import Optional, Tuple
+from datetime import date, datetime
+from typing import Any, Optional, Tuple
+
+from dotenv import load_dotenv
+
+# Carrega .env na raiz do projeto; não sobrescreve variáveis já definidas no ambiente.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+logging.getLogger(__name__).info(
+    "DATABASE_URL detected: %s",
+    "yes" if (os.environ.get("DATABASE_URL") or "").strip() else "no",
+)
 
 import pandas as pd
+
+from utils.app_auth import (
+    ensure_authenticated_or_stop,
+    get_audit_session_user,
+    get_audit_session_user_id,
+    get_session_tenant_id,
+    get_session_user_role,
+    is_auth_configured,
+    logout,
+)
+from utils.critical_log import log_critical_event
+from utils.rbac import is_admin, require_admin, require_operator_or_admin
+from utils.formatters import (
+    format_money,
+    format_product_created_display,
+    format_qty_display_4,
+)
+from utils.validators import (
+    attribute_select_index,
+    dropdown_with_other,
+    filter_customers_by_search,
+    normalize_cpf_digits,
+    normalize_phone_digits,
+    parse_cost_quantity_text,
+    parse_cost_unit_price_value,
+    resolve_attribute_value,
+    sanitize_cep_digits,
+    validate_cpf_br,
+    validate_email_optional,
+)
 import streamlit as st
 
-from database.connection import DB_PATH, get_conn
-from database.constants import (
+from database.connection import maybe_run_periodic_database_health
+from services.db_startup import run_database_init
+from services.domain_constants import (
     DUPLICATE_SKU_BASE_ERROR_MSG,
+    FILTER_ANY,
+    SALE_PAYMENT_OPTIONS,
     SKU_COST_COMPONENT_DEFINITIONS,
 )
-from database.cost_components_repo import (
-    ensure_sku_cost_component_rows,
-    recompute_sku_structured_cost_total,
-)
-from database.customer_sync import format_customer_code
-from database.init_db import init_db
-from database.product_codes import make_product_enter_code
-from database.sale_codes import _next_sale_sequence, format_sale_code
-from database.sku_codec import (
-    _next_sku_sequence,
+from services.product_lot_facade import (
     build_product_sku_body,
-    format_sku_sequence_int,
-    sku_base_body_exists,
+    hard_delete_sku_catalog,
+    product_image_abs_path,
+    product_lot_edit_block_reason,
+    sku_correction_block_reason,
+    update_product_lot_attributes,
+    update_product_lot_photo,
 )
-from database.sku_master_repo import ensure_sku_master, sync_sku_master_totals
+from services.read_queries import (
+    fetch_active_sku_pricing_record,
+    fetch_customers_ordered,
+    fetch_price_history_for_sku,
+    fetch_product_batches_for_sku,
+    fetch_product_batches_in_stock_for_sku,
+    fetch_product_by_id,
+    fetch_product_search_attribute_options,
+    fetch_product_triple_label_by_sku,
+    fetch_products,
+    fetch_recent_stock_cost_entries,
+    fetch_skus_available_for_sale,
+    fetch_sku_cost_components_for_sku,
+    fetch_sku_master_rows,
+    fetch_sku_pricing_records_for_sku,
+    get_persisted_structured_unit_cost,
+    peek_next_customer_code_preview,
+    search_products_filtered,
+)
+from services.sqlite_admin import get_sqlite_db_path
+from services.tenant_scope import effective_tenant_id_for_request
+from services.uat_checklist_service import (
+    UAT_MANUAL_CASES,
+    UAT_STATUS_LABELS,
+    UAT_STATUS_ORDER,
+    fetch_map_for_tenant,
+    upsert_uat_record,
+)
+from utils.audit_backup import (
+    maybe_run_periodic_maintenance_backups,
+    register_sqlite_full_backup_atexit,
+    run_startup_sqlite_full_backup_once,
+)
+from services.customer_service import (
+    delete_customer_row,
+    insert_customer_row,
+    update_customer_row,
+)
+from services.product_service import (
+    add_product,
+    add_stock_receipt,
+    apply_manual_stock_write_down,
+    apply_stock_receipt,
+    clear_batch_pricing_only,
+    compute_sku_pricing_targets,
+    fetch_product_stock_name_sku,
+    generate_product_sku,
+    reset_batch_pricing_and_exclude,
+    save_sku_cost_structure,
+    save_sku_pricing_workflow,
+    set_product_pricing,
+    set_product_pricing_for_batch,
+    update_product_attributes,
+    update_sku_selling_price,
+)
+from services.sales_service import fetch_recent_sales_for_ui, record_sale
+from utils.painel_dashboard import render_painel_executivo
 
 _logger = logging.getLogger(__name__)
 
@@ -43,10 +136,15 @@ PAGE_PRECIFICACAO = "Precificação"
 PAGE_VENDAS = "Vendas"
 PAGE_CLIENTES = "Clientes"
 PAGE_PAINEL = "Painel"
+PAGE_UAT = "Checklist UAT"
 
-FILTER_ANY = "Qualquer"
+# Precificação (fluxo SKU): modo de cada parâmetro na UI
+PRICING_MODE_PCT = "Percentual (%)"
+PRICING_MODE_ABS = "Valor fixo (R$)"
 
-CURRENCY_SYMBOL = "R$"
+# Custos — composição de custo: forma de localizar o SKU na UI
+COSTING_STRUCT_PICK_SKU = "Por SKU"
+COSTING_STRUCT_PICK_NAME = "Por nome do produto"
 
 # Product registration — dropdown options (pt-BR; valores gravados no banco / SKU)
 PRODUCT_GENDER_OPTIONS = ["Masculino", "Feminino", "Unissex"]
@@ -170,23 +268,6 @@ SELECT_LABEL = "Selecione"
 OTHER_LABEL = "Outro"
 
 
-def dropdown_with_other(base_options):
-    """[…opções…, 'Outro'] — 'Outro' é opção normal (valor literal salvo); placeholder no select."""
-    return list(base_options) + [OTHER_LABEL]
-
-
-def attribute_select_index(options, current_value) -> Optional[int]:
-    """Índice do selectbox a partir do valor do BD, ou None = mostrar placeholder. Valores fora da lista → Outro."""
-    cur = (current_value or "").strip()
-    if not cur or cur == SELECT_LABEL:
-        return None
-    if cur in options:
-        return options.index(cur)
-    if OTHER_LABEL in options:
-        return options.index(OTHER_LABEL)
-    return None
-
-
 def attribute_selectbox(label: str, options: list, *, key: str, current_value: str = "") -> object:
     """
     Selectbox com placeholder acinzentado «Selecione» quando nada foi escolhido (Streamlit 1.29+).
@@ -207,42 +288,6 @@ def attribute_selectbox(label: str, options: list, *, key: str, current_value: s
         index=idx,
         key=key,
     )
-
-
-def resolve_attribute_value(choice, other_text, field_label):
-    """
-    Returns (value_or_none, error_message_or_none).
-
-    Se "Outro" for selecionado, grava o rótulo literal (sem campo de texto extra).
-    """
-    if choice is None:
-        return None, f"Selecione {field_label}."
-    if choice == OTHER_LABEL:
-        t = (other_text or "").strip()
-        if t:
-            return t, None
-        return OTHER_LABEL, None
-    return choice, None
-
-
-def _next_customer_sequence(conn: sqlite3.Connection) -> int:
-    """Atomically increment persistent customer sequence and return the new value."""
-    cur = conn.execute(
-        """
-        UPDATE customer_sequence_counter
-        SET last_value = last_value + 1
-        WHERE id = 1
-        RETURNING last_value;
-        """
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise RuntimeError("Contador de sequência de cliente não inicializado.")
-    return int(row["last_value"])
-
-
-def sanitize_cep_digits(cep: str) -> str:
-    return re.sub(r"\D", "", cep or "")
 
 
 def fetch_viacep_address(cep: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -281,226 +326,7 @@ def fetch_viacep_address(cep: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, f"Falha na consulta do CEP: {e}"
 
 
-def normalize_cpf_digits(value: str) -> str:
-    return re.sub(r"\D", "", value or "")
-
-
-def normalize_phone_digits(value: str) -> str:
-    return re.sub(r"\D", "", value or "")
-
-
-def validate_cpf_br(value: str) -> bool:
-    """Brazil CPF check digits (returns False if empty after strip)."""
-    cpf = normalize_cpf_digits(value)
-    if len(cpf) != 11:
-        return False
-    if cpf == cpf[0] * 11:
-        return False
-
-    def calc_digit(base: str, factor_start: int) -> int:
-        total = 0
-        for i, ch in enumerate(base):
-            total += int(ch) * (factor_start - i)
-        remainder = total % 11
-        return 0 if remainder < 2 else 11 - remainder
-
-    d1 = calc_digit(cpf[:9], 10)
-    if int(cpf[9]) != d1:
-        return False
-    d2 = calc_digit(cpf[:9] + str(d1), 11)
-    return int(cpf[10]) == d2
-
-
-def validate_email_optional(email: str) -> bool:
-    s = (email or "").strip()
-    if not s:
-        return True
-    return bool(
-        re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", s)
-    )
-
-
-def find_customer_duplicate(
-    conn: sqlite3.Connection,
-    cpf_digits: str,
-    phone_digits: str,
-    exclude_id: Optional[int] = None,
-) -> Optional[Tuple[str, sqlite3.Row]]:
-    """
-    If cpf_digits or phone_digits is non-empty, check for another row with same value.
-    Returns ("cpf"|"phone", row) or None.
-    """
-    if cpf_digits:
-        q = "SELECT id, customer_code, name, cpf, phone FROM customers WHERE cpf = ?"
-        params: list = [cpf_digits]
-        if exclude_id is not None:
-            q += " AND id != ?"
-            params.append(exclude_id)
-        row = conn.execute(q, params).fetchone()
-        if row:
-            return ("cpf", row)
-    if phone_digits:
-        q = "SELECT id, customer_code, name, cpf, phone FROM customers WHERE phone = ?"
-        params = [phone_digits]
-        if exclude_id is not None:
-            q += " AND id != ?"
-            params.append(exclude_id)
-        row = conn.execute(q, params).fetchone()
-        if row:
-            return ("phone", row)
-    return None
-
-
-def _sqlite_safe_rollback(conn: sqlite3.Connection) -> None:
-    """Use API rollback; avoid OperationalError from raw ROLLBACK when no txn is active."""
-    try:
-        conn.rollback()
-    except sqlite3.OperationalError:
-        pass
-
-
-def insert_customer_row(
-    name: str,
-    cpf: Optional[str],
-    rg: Optional[str],
-    phone: Optional[str],
-    email: Optional[str],
-    instagram: Optional[str],
-    zip_code: Optional[str],
-    street: Optional[str],
-    number: Optional[str],
-    neighborhood: Optional[str],
-    city: Optional[str],
-    state: Optional[str],
-    country: Optional[str],
-) -> str:
-    """Allocate customer_code, insert row. Returns new customer_code."""
-    now = datetime.now().isoformat(timespec="seconds")
-    with get_conn() as conn:
-        conn.isolation_level = None
-        conn.execute("BEGIN IMMEDIATE;")
-        try:
-            dup = find_customer_duplicate(conn, cpf or "", phone or "", None)
-            if dup:
-                kind, row = dup
-                _sqlite_safe_rollback(conn)
-                label = "CPF" if kind == "cpf" else "Telefone"
-                raise ValueError(
-                    f"{label} duplicado: "
-                    f"já usado pelo cliente {row['customer_code']} — {row['name']}."
-                )
-            n = _next_customer_sequence(conn)
-            code = format_customer_code(n)
-            conn.execute(
-                """
-                INSERT INTO customers (
-                    customer_code, name, cpf, rg, phone, email, instagram,
-                    zip_code, street, number, neighborhood, city, state, country,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    code,
-                    name.strip(),
-                    cpf or None,
-                    rg or None,
-                    phone or None,
-                    email or None,
-                    instagram or None,
-                    zip_code or None,
-                    street or None,
-                    number or None,
-                    neighborhood or None,
-                    city or None,
-                    state or None,
-                    country or None,
-                    now,
-                    now,
-                ),
-            )
-            conn.execute("COMMIT;")
-            return code
-        except Exception:
-            _sqlite_safe_rollback(conn)
-            raise
-
-
-def update_customer_row(
-    customer_id: int,
-    name: str,
-    cpf: Optional[str],
-    rg: Optional[str],
-    phone: Optional[str],
-    email: Optional[str],
-    instagram: Optional[str],
-    zip_code: Optional[str],
-    street: Optional[str],
-    number: Optional[str],
-    neighborhood: Optional[str],
-    city: Optional[str],
-    state: Optional[str],
-    country: Optional[str],
-) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    with get_conn() as conn:
-        conn.isolation_level = None
-        conn.execute("BEGIN IMMEDIATE;")
-        try:
-            dup = find_customer_duplicate(conn, cpf or "", phone or "", customer_id)
-            if dup:
-                kind, row = dup
-                _sqlite_safe_rollback(conn)
-                label = "CPF" if kind == "cpf" else "Telefone"
-                raise ValueError(
-                    f"{label} duplicado: "
-                    f"já usado pelo cliente {row['customer_code']} — {row['name']}."
-                )
-            conn.execute(
-                """
-                UPDATE customers SET
-                    name = ?, cpf = ?, rg = ?, phone = ?, email = ?, instagram = ?,
-                    zip_code = ?, street = ?, number = ?, neighborhood = ?,
-                    city = ?, state = ?, country = ?, updated_at = ?
-                WHERE id = ?;
-                """,
-                (
-                    name.strip(),
-                    cpf or None,
-                    rg or None,
-                    phone or None,
-                    email or None,
-                    instagram or None,
-                    zip_code or None,
-                    street or None,
-                    number or None,
-                    neighborhood or None,
-                    city or None,
-                    state or None,
-                    country or None,
-                    now,
-                    customer_id,
-                ),
-            )
-            conn.execute("COMMIT;")
-        except Exception:
-            _sqlite_safe_rollback(conn)
-            raise
-
-
-def fetch_customers_ordered() -> list:
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, customer_code, name, cpf, rg, phone, email, instagram,
-                   zip_code, street, number, neighborhood, city, state, country,
-                   created_at, updated_at
-            FROM customers
-            ORDER BY CAST(customer_code AS INTEGER);
-            """
-        ).fetchall()
-
-
-def init_cust_edit_session(r: sqlite3.Row, cid: int) -> None:
+def init_cust_edit_session(r: Any, cid: int) -> None:
     """Load customer row into Streamlit session keys for the edit form."""
     st.session_state[f"cust_edit_name_{cid}"] = r["name"] or ""
     st.session_state[f"cust_edit_cpf_{cid}"] = r["cpf"] or ""
@@ -515,465 +341,6 @@ def init_cust_edit_session(r: sqlite3.Row, cid: int) -> None:
     st.session_state[f"cust_edit_city_{cid}"] = r["city"] or ""
     st.session_state[f"cust_edit_state_{cid}"] = r["state"] or ""
     st.session_state[f"cust_edit_country_{cid}"] = r["country"] or ""
-
-
-def peek_next_customer_code_preview() -> str:
-    """Read-only preview of the next code (does not consume sequence)."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT last_value FROM customer_sequence_counter WHERE id = 1;"
-        ).fetchone()
-        n = int(row["last_value"] or 0) + 1 if row else 1
-        return format_customer_code(n)
-
-
-def fetch_skus_available_for_sale() -> list:
-    """SKUs with active price and positive aggregate stock (sku_master)."""
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT sm.sku,
-                   COALESCE(sm.selling_price, 0) AS selling_price,
-                   COALESCE(sm.total_stock, 0) AS total_stock,
-                   (
-                       SELECT p.name FROM products p
-                       WHERE p.sku = sm.sku AND p.deleted_at IS NULL
-                       ORDER BY p.id LIMIT 1
-                   ) AS sample_name
-            FROM sku_master sm
-            WHERE sm.deleted_at IS NULL
-              AND COALESCE(sm.selling_price, 0) > 0
-              AND COALESCE(sm.total_stock, 0) > 0
-            ORDER BY sm.sku COLLATE NOCASE;
-            """
-        ).fetchall()
-
-
-def fetch_product_batches_in_stock_for_sku(sku: str) -> list:
-    """Lotes do SKU com estoque > 0 (fluxo de vendas)."""
-    sku = (sku or "").strip()
-    if not sku:
-        return []
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT p.id, p.name, p.stock, p.product_enter_code,
-                   p.frame_color, p.lens_color, p.style, p.palette, p.gender
-            FROM products p
-            WHERE p.sku = ? AND p.deleted_at IS NULL
-              AND COALESCE(p.stock, 0) > 0
-            ORDER BY p.id;
-            """,
-            (sku,),
-        ).fetchall()
-
-
-def filter_customers_by_search(rows: list, query: str) -> list:
-    """Filter customer rows by substring on name or customer_code (case-insensitive)."""
-    q = (query or "").strip().lower()
-    if not q:
-        return list(rows)
-    out = []
-    for r in rows:
-        code = str(r["customer_code"] or "").lower()
-        name = str(r["name"] or "").lower()
-        if q in code or q in name:
-            out.append(r)
-    return out
-
-
-def apply_stock_receipt(
-    conn: sqlite3.Connection,
-    sku: str,
-    product_id: int,
-    quantity: float,
-    unit_cost: float,
-) -> None:
-    """
-    Weighted-average inventory cost update for a stock receipt.
-    New avg = ((prev_total * prev_avg) + (qty * unit_cost)) / (prev_total + qty)
-    """
-    qty = round(float(quantity), 4)
-    if qty <= 0:
-        raise ValueError("A quantidade deve ser maior que zero.")
-    if unit_cost <= 0:
-        raise ValueError("O custo unitário deve ser maior que zero.")
-    sku = sku.strip()
-
-    prow = conn.execute(
-        "SELECT id, sku, deleted_at FROM products WHERE id = ?;",
-        (int(product_id),),
-    ).fetchone()
-    if prow is None:
-        raise ValueError("Lote de produto não encontrado.")
-    if (prow["sku"] or "").strip() != sku:
-        raise ValueError("O SKU do produto não corresponde ao lote selecionado.")
-    if prow["deleted_at"]:
-        raise ValueError(
-            "Não é possível adicionar estoque a um lote inativo (excluído logicamente)."
-        )
-
-    sm_del = conn.execute(
-        "SELECT deleted_at FROM sku_master WHERE sku = ?;",
-        (sku,),
-    ).fetchone()
-    if sm_del and sm_del["deleted_at"]:
-        raise ValueError(
-            "Não é possível adicionar estoque a um SKU inativo (excluído logicamente)."
-        )
-
-    ensure_sku_master(conn, sku)
-    prev_total = float(
-        conn.execute(
-            """
-            SELECT COALESCE(SUM(stock), 0) FROM products
-            WHERE sku = ? AND deleted_at IS NULL;
-            """,
-            (sku,),
-        ).fetchone()[0]
-    )
-    sm = conn.execute(
-        "SELECT avg_unit_cost FROM sku_master WHERE sku = ?;",
-        (sku,),
-    ).fetchone()
-    prev_avg = float(sm["avg_unit_cost"] or 0.0)
-
-    new_total = prev_total + qty
-    new_avg = (
-        ((prev_total * prev_avg) + (qty * float(unit_cost))) / new_total
-        if new_total > 0
-        else 0.0
-    )
-    total_entry_cost = round(qty * float(unit_cost), 2)
-
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """
-        INSERT INTO stock_cost_entries (
-            sku, product_id, quantity, unit_cost, total_entry_cost,
-            stock_before, stock_after, avg_cost_before, avg_cost_after, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        (
-            sku,
-            int(product_id),
-            qty,
-            float(unit_cost),
-            total_entry_cost,
-            prev_total,
-            new_total,
-            prev_avg,
-            new_avg,
-            now,
-        ),
-    )
-
-    conn.execute(
-        "UPDATE products SET stock = stock + ? WHERE id = ?;",
-        (qty, int(product_id)),
-    )
-    conn.execute(
-        "UPDATE products SET cost = ? WHERE sku = ?;",
-        (new_avg, sku),
-    )
-
-    actual_total = float(
-        conn.execute(
-            """
-            SELECT COALESCE(SUM(stock), 0) FROM products
-            WHERE sku = ? AND deleted_at IS NULL;
-            """,
-            (sku,),
-        ).fetchone()[0]
-    )
-    conn.execute(
-        """
-        UPDATE sku_master
-        SET total_stock = ?, avg_unit_cost = ?, updated_at = ?
-        WHERE sku = ?;
-        """,
-        (actual_total, new_avg, now, sku),
-    )
-
-
-def update_sku_selling_price(sku: str, new_price: float, note: str = "") -> None:
-    """Set selling price for a SKU (does not change inventory cost). History is appended."""
-    if not sku or not str(sku).strip():
-        raise ValueError("SKU é obrigatório.")
-    if new_price <= 0:
-        raise ValueError("O preço de venda deve ser maior que zero.")
-    sku = sku.strip()
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT selling_price FROM sku_master WHERE sku = ?;",
-            (sku,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(
-                "SKU não encontrado no estoque. "
-                "Cadastre um produto ou registre uma entrada de estoque primeiro."
-            )
-        old = float(row["selling_price"] or 0.0)
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """
-            INSERT INTO price_history (sku, old_price, new_price, created_at, note)
-            VALUES (?, ?, ?, ?, ?);
-            """,
-            (sku, old, float(new_price), now, note or ""),
-        )
-        conn.execute(
-            """
-            UPDATE sku_master SET selling_price = ?, updated_at = ? WHERE sku = ?;
-            """,
-            (float(new_price), now, sku),
-        )
-        conn.execute(
-            """
-            UPDATE products SET price = ? WHERE sku = ?;
-            """,
-            (float(new_price), sku),
-        )
-
-
-def compute_sku_pricing_targets(
-    avg_cost: float,
-    markup_pct: float,
-    taxes_pct: float,
-    interest_pct: float,
-) -> tuple[float, float, float]:
-    """
-    Pricing workflow (percentages as whole numbers, e.g. 10.5 = 10.5%):
-    1) Price before taxes = Avg cost + (Avg cost × Markup%)
-    2) Price with taxes = Price before + (Price before × Taxes%)
-    3) Target price = Price with taxes + (Price with taxes × Interest%)
-    """
-    ac = float(avg_cost)
-    m = float(markup_pct) / 100.0
-    t = float(taxes_pct) / 100.0
-    i = float(interest_pct) / 100.0
-    price_before = ac + (ac * m)
-    price_with_taxes = price_before + (price_before * t)
-    target = price_with_taxes + (price_with_taxes * i)
-    return round(price_before, 2), round(price_with_taxes, 2), round(target, 2)
-
-
-def save_sku_pricing_workflow(
-    sku: str,
-    markup_pct: float,
-    taxes_pct: float,
-    interest_pct: float,
-) -> int:
-    """
-    Append-only pricing record; deactivates prior rows for this SKU and sets the new row active.
-    Applies target_price to sku_master.selling_price and products.price (sales use this price).
-    """
-    sku = sku.strip()
-    markup_pct = round(float(markup_pct), 2)
-    taxes_pct = round(float(taxes_pct), 2)
-    interest_pct = round(float(interest_pct), 2)
-    if markup_pct < 0 or taxes_pct < 0 or interest_pct < 0:
-        raise ValueError("Markup, impostos e juros devem ser zero ou maiores.")
-
-    with get_conn() as conn:
-        conn.isolation_level = None
-        try:
-            conn.execute("BEGIN;")
-            row = conn.execute(
-                "SELECT selling_price, avg_unit_cost FROM sku_master WHERE sku = ?;",
-                (sku,),
-            ).fetchone()
-            if row is None:
-                raise ValueError("SKU não cadastrado no mestre de estoque.")
-            avg_cost = float(row["avg_unit_cost"] or 0.0)
-            if avg_cost <= 0:
-                raise ValueError(
-                    "O custo médio de estoque (CMP) não está disponível para este SKU. "
-                    "Registre entradas de estoque na página Custos para definir o CMP antes de precificar."
-                )
-            old_sell = float(row["selling_price"] or 0.0)
-            pb, pwt, target = compute_sku_pricing_targets(
-                avg_cost, markup_pct, taxes_pct, interest_pct
-            )
-            if target <= 0:
-                raise ValueError("O preço-alvo calculado deve ser maior que zero.")
-            now = datetime.now().isoformat(timespec="seconds")
-            conn.execute(
-                "UPDATE sku_pricing_records SET is_active = 0 WHERE sku = ?;",
-                (sku,),
-            )
-            cur = conn.execute(
-                """
-                INSERT INTO sku_pricing_records (
-                    sku, avg_cost_snapshot, markup_pct, taxes_pct, interest_pct,
-                    price_before_taxes, price_with_taxes, target_price, created_at, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1);
-                """,
-                (
-                    sku,
-                    avg_cost,
-                    markup_pct,
-                    taxes_pct,
-                    interest_pct,
-                    pb,
-                    pwt,
-                    target,
-                    now,
-                ),
-            )
-            new_id = int(cur.lastrowid)
-            conn.execute(
-                """
-                UPDATE sku_master SET selling_price = ?, updated_at = ? WHERE sku = ?;
-                """,
-                (target, now, sku),
-            )
-            conn.execute(
-                """
-                UPDATE products SET price = ? WHERE sku = ?;
-                """,
-                (target, sku),
-            )
-            conn.execute(
-                """
-                INSERT INTO price_history (sku, old_price, new_price, created_at, note)
-                VALUES (?, ?, ?, ?, ?);
-                """,
-                (
-                    sku,
-                    old_sell,
-                    target,
-                    now,
-                    "Pricing workflow (markup / taxes / interest)",
-                ),
-            )
-            conn.execute("COMMIT;")
-            return new_id
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
-
-
-def fetch_sku_pricing_records_for_sku(sku: str, limit: int = 100):
-    """Workflow pricing history for one SKU (newest first)."""
-    sku = sku.strip()
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, sku, avg_cost_snapshot, markup_pct, taxes_pct, interest_pct,
-                   price_before_taxes, price_with_taxes, target_price, created_at, is_active
-            FROM sku_pricing_records
-            WHERE sku = ?
-            ORDER BY id DESC
-            LIMIT ?;
-            """,
-            (sku, int(limit)),
-        ).fetchall()
-
-
-def fetch_active_sku_pricing_record(sku: str):
-    """Most recent active workflow record for a SKU (if any)."""
-    sku = sku.strip()
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, sku, avg_cost_snapshot, markup_pct, taxes_pct, interest_pct,
-                   price_before_taxes, price_with_taxes, target_price, created_at, is_active
-            FROM sku_pricing_records
-            WHERE sku = ? AND is_active = 1
-            ORDER BY id DESC
-            LIMIT 1;
-            """,
-            (sku,),
-        ).fetchone()
-
-
-def add_stock_receipt(sku: str, product_id: int, quantity: float, unit_cost: float) -> None:
-    """Apply a stock receipt at SKU level (weighted-average inventory cost)."""
-    with get_conn() as conn:
-        conn.isolation_level = None
-        try:
-            conn.execute("BEGIN;")
-            apply_stock_receipt(conn, sku, product_id, float(quantity), float(unit_cost))
-            conn.execute("COMMIT;")
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
-
-
-def fetch_sku_master_rows():
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT sku, total_stock, avg_unit_cost, selling_price, structured_cost_total, updated_at
-            FROM sku_master
-            WHERE deleted_at IS NULL
-            ORDER BY sku;
-            """
-        ).fetchall()
-
-
-def fetch_recent_stock_cost_entries(limit: int = 50):
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, sku, product_id, quantity, unit_cost, total_entry_cost, stock_before, stock_after,
-                   avg_cost_before, avg_cost_after, created_at
-            FROM stock_cost_entries
-            ORDER BY id DESC
-            LIMIT ?;
-            """,
-            (int(limit),),
-        ).fetchall()
-
-
-def get_persisted_structured_unit_cost(sku: str) -> float:
-    """
-    Planned unit cost per SKU from saved cost components (sku_master.structured_cost_total).
-    Does not recompute from form state — user must save the cost breakdown first.
-    """
-    sku = sku.strip()
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(structured_cost_total, 0) AS t, deleted_at FROM sku_master WHERE sku = ?;",
-            (sku,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("SKU não cadastrado no mestre de estoque.")
-        if row["deleted_at"]:
-            raise ValueError("SKU inativo (excluído logicamente).")
-        return float(row["t"] or 0.0)
-
-
-def fetch_product_batches_for_sku(sku: str) -> list:
-    """Product rows (batches) for a given SKU — stock receipts apply to one batch."""
-    sku = sku.strip()
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked, stock,
-                   frame_color, lens_color, style, palette, gender
-            FROM products
-            WHERE TRIM(COALESCE(sku, '')) = ?
-              AND deleted_at IS NULL
-            ORDER BY id DESC;
-            """,
-            (sku,),
-        ).fetchall()
-
-
-def fetch_price_history_for_sku(sku: str, limit: int = 40):
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT id, sku, old_price, new_price, created_at, note
-            FROM price_history
-            WHERE sku = ?
-            ORDER BY id DESC
-            LIMIT ?;
-            """,
-            (sku.strip(), int(limit)),
-        ).fetchall()
 
 
 def _maybe_preview_product_sku() -> Optional[str]:
@@ -1012,823 +379,10 @@ def _maybe_preview_product_sku() -> Optional[str]:
     return f"XXX-{body}"
 
 
-def update_product_attributes(
-    product_id: int,
-    frame_color: str,
-    lens_color: str,
-    style: str,
-    palette: str,
-    gender: str,
-) -> None:
-    """
-    Update attributes and recalculate SKU from product name + attributes.
-    Raises ValueError if another product already shares the same SKU base (body without SEQ),
-    or the same full SKU.
-    """
-    frame_color = (frame_color or "").strip()
-    lens_color = (lens_color or "").strip()
-    style = (style or "").strip()
-    palette = (palette or "").strip()
-    gender = (gender or "").strip()
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT name, sku FROM products WHERE id = ?;",
-            (int(product_id),),
-        ).fetchone()
-        if row is None:
-            raise ValueError("Produto não encontrado.")
-        name = str(row["name"] or "").strip()
-        old_sku = str(row["sku"] or "").strip()
-        base_sku = build_product_sku_body(
-            name, frame_color, lens_color, gender, palette, style
-        )
-        if sku_base_body_exists(
-            conn,
-            base_sku,
-            exclude_product_id=product_id,
-        ):
-            raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
-        oparts = old_sku.split("-")
-        if oparts and oparts[0].isdigit():
-            new_sku = f"{oparts[0]}-{base_sku}"
-        else:
-            new_sku = generate_product_sku(
-                name,
-                frame_color,
-                lens_color,
-                gender,
-                palette,
-                style,
-                exclude_product_id=product_id,
-            )
-        dup = conn.execute(
-            """
-            SELECT id FROM products
-            WHERE sku = ? AND id != ?;
-            """,
-            (new_sku, int(product_id)),
-        ).fetchone()
-        if dup is not None:
-            raise ValueError(
-                f"Seria criado um SKU duplicado `{new_sku}`. "
-                "Ajuste o nome do produto ou os atributos para obter um SKU único."
-            )
-        conn.execute(
-            """
-            UPDATE products
-            SET frame_color = ?, lens_color = ?, style = ?, palette = ?, gender = ?, sku = ?
-            WHERE id = ?;
-            """,
-            (frame_color, lens_color, style, palette, gender, new_sku, int(product_id)),
-        )
-
-
-def format_qty_display_4(q: float) -> str:
-    """Format quantity for text inputs; empty string means zero."""
-    v = round(float(q), 4)
-    if abs(v) < 1e-12:
-        return ""
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
-    return s if s else "0"
-
-
-def parse_cost_quantity_text(raw: str) -> tuple[float, Optional[str]]:
-    """Non-negative quantity, up to 4 decimal places. Empty -> 0."""
-    s = (raw or "").strip().replace(",", ".")
-    if s == "":
-        return 0.0, None
-    for c in s:
-        if c not in "0123456789.":
-            return 0.0, "Use apenas dígitos e um ponto decimal."
-    if s.count(".") > 1:
-        return 0.0, "Permitido apenas um ponto decimal."
-    if s == ".":
-        return 0.0, None
-    parts = s.split(".")
-    if len(parts) == 2 and len(parts[1]) > 4:
-        return 0.0, "No máximo 4 casas decimais na quantidade."
-    try:
-        v = float(s)
-    except ValueError:
-        return 0.0, "Número inválido."
-    if v < 0:
-        return 0.0, "A quantidade não pode ser negativa."
-    return round(v, 4), None
-
-
-def parse_cost_unit_price_value(value: float) -> tuple[float, Optional[str]]:
-    """Unit price: non-negative, rounded to 2 decimals."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return 0.0, "Preço unitário inválido."
-    if v < 0:
-        return 0.0, "Preço unitário não pode ser negativo."
-    return round(v, 2), None
-
-
-def generate_product_sku(
-    product_name: str,
-    frame_color: str,
-    lens_color: str,
-    gender: str,
-    palette: str,
-    style: str,
-    *,
-    exclude_product_id: Optional[int] = None,
-) -> str:
-    """
-    SKU completo: [SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]. SEQ = contador persistente (001+).
-    """
-    with get_conn() as conn:
-        conn.isolation_level = None
-        conn.execute("BEGIN IMMEDIATE;")
-        try:
-            body = build_product_sku_body(
-                product_name, frame_color, lens_color, gender, palette, style
-            )
-            if sku_base_body_exists(
-                conn,
-                body,
-                exclude_product_id=exclude_product_id,
-            ):
-                raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
-            n = _next_sku_sequence(conn)
-            conn.execute("COMMIT;")
-            return f"{format_sku_sequence_int(n)}-{body}"
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
-
-
-def fetch_sku_cost_components_for_sku(sku: str) -> list:
-    """Rows ordered like SKU_COST_COMPONENT_DEFINITIONS."""
-    sku = sku.strip()
-    with get_conn() as conn:
-        ensure_sku_cost_component_rows(conn, sku)
-        by_key = {}
-        rows = conn.execute(
-            """
-            SELECT component_key, label, unit_price, quantity, line_total, updated_at
-            FROM sku_cost_components
-            WHERE sku = ?;
-            """,
-            (sku,),
-        ).fetchall()
-        for r in rows:
-            by_key[r["component_key"]] = r
-    out = []
-    for key, label in SKU_COST_COMPONENT_DEFINITIONS:
-        r = by_key.get(key)
-        if r is None:
-            out.append(
-                {
-                    "component_key": key,
-                    "label": label,
-                    "unit_price": 0.0,
-                    "quantity": 0.0,
-                    "line_total": 0.0,
-                    "updated_at": None,
-                }
-            )
-        else:
-            out.append(
-                {
-                    "component_key": key,
-                    "label": r["label"],
-                    "unit_price": float(r["unit_price"] or 0),
-                    "quantity": float(r["quantity"] or 0),
-                    "line_total": float(r["line_total"] or 0),
-                    "updated_at": r["updated_at"],
-                }
-            )
-    return out
-
-
-def save_sku_cost_structure(sku: str, component_inputs: list) -> float:
-    """
-    Persist component lines. component_inputs: list of (component_key, unit_price, unit_quantity).
-    Returns stored structured total SKU cost.
-    """
-    sku = sku.strip()
-    with get_conn() as conn:
-        conn.isolation_level = None
-        try:
-            conn.execute("BEGIN;")
-            sm = conn.execute(
-                "SELECT 1 FROM sku_master WHERE sku = ?;",
-                (sku,),
-            ).fetchone()
-            if sm is None:
-                raise ValueError("SKU não cadastrado no mestre de estoque.")
-            ensure_sku_cost_component_rows(conn, sku)
-            now = datetime.now().isoformat(timespec="seconds")
-            for key, unit_price, quantity in component_inputs:
-                unit_price = round(float(unit_price), 2)
-                quantity = round(float(quantity), 4)
-                if unit_price < 0 or quantity < 0:
-                    raise ValueError("Preço unitário e quantidade não podem ser negativos.")
-                line_total = round(unit_price * quantity, 2)
-                conn.execute(
-                    """
-                    UPDATE sku_cost_components
-                    SET unit_price = ?, quantity = ?, line_total = ?, updated_at = ?
-                    WHERE sku = ? AND component_key = ?;
-                    """,
-                    (unit_price, quantity, line_total, now, sku, key),
-                )
-            total = recompute_sku_structured_cost_total(conn, sku)
-            conn.execute("COMMIT;")
-            return float(total)
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
-
-
-
-def format_money(value: float) -> str:
-    """Formata valor em pt-BR (ex.: R$ 1.234,56)."""
-    try:
-        v = float(value)
-    except TypeError:
-        v = float(value)
-    sign = "-" if v < 0 else ""
-    v = abs(v)
-    s = f"{v:,.2f}"
-    s = s.replace(",", "§").replace(".", ",").replace("§", ".")
-    return f"{sign}{CURRENCY_SYMBOL} {s}"
-
-
-def fetch_products():
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, name, sku, registered_date, product_enter_code, cost, price, pricing_locked, stock,
-                   frame_color, lens_color, style, palette, gender
-            FROM products
-            WHERE deleted_at IS NULL
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    return rows
-
-
-def _sku_search_sanitize_text(q: str) -> str:
-    """Lowercase substring for LIKE; strip wildcard chars to avoid pattern injection."""
-    return (q or "").strip().lower().replace("%", "").replace("_", "")
-
-
-def fetch_product_search_attribute_options() -> dict:
-    """Valores distintos para filtros da busca por SKU."""
-    out: dict = {
-        "frame_color": [],
-        "lens_color": [],
-        "gender": [],
-        "palette": [],
-        "style": [],
-    }
-    with get_conn() as conn:
-        for key, col in [
-            ("frame_color", "frame_color"),
-            ("lens_color", "lens_color"),
-            ("gender", "gender"),
-            ("palette", "palette"),
-            ("style", "style"),
-        ]:
-            rows = conn.execute(
-                f"""
-                SELECT DISTINCT TRIM({col}) AS v
-                FROM products
-                WHERE {col} IS NOT NULL AND TRIM({col}) != ''
-                  AND deleted_at IS NULL
-                ORDER BY v COLLATE NOCASE;
-                """
-            ).fetchall()
-            out[key] = [str(r["v"]) for r in rows if r["v"] is not None and str(r["v"]).strip()]
-    return out
-
-
-def search_products_filtered(
-    text_q: str,
-    frame_color_filter: str,
-    lens_color_filter: str,
-    gender_filter: str,
-    palette_filter: str,
-    style_filter: str,
-    sort_by: str,
-    limit: int,
-    offset: int,
-) -> Tuple[list, int]:
-    """
-    Partial match on SKU and product name; optional exact-match attribute filters.
-    Returns (rows as sqlite3.Row list, total matching count).
-    """
-    t = _sku_search_sanitize_text(text_q)
-    wheres = ["p.deleted_at IS NULL"]
-    params: list = []
-    if t:
-        pat = f"%{t}%"
-        wheres.append(
-            "(LOWER(COALESCE(p.sku, '')) LIKE ? OR LOWER(COALESCE(p.name, '')) LIKE ?)"
-        )
-        params.extend([pat, pat])
-
-    for val, pcol in [
-        (frame_color_filter, "p.frame_color"),
-        (lens_color_filter, "p.lens_color"),
-        (gender_filter, "p.gender"),
-        (palette_filter, "p.palette"),
-        (style_filter, "p.style"),
-    ]:
-        if val and str(val).strip() and str(val) != FILTER_ANY:
-            wheres.append(f"TRIM(COALESCE({pcol}, '')) = ?")
-            params.append(str(val).strip())
-
-    where_sql = " AND ".join(wheres)
-    order_map = {
-        "sku": "p.sku COLLATE NOCASE ASC",
-        "name": "p.name COLLATE NOCASE ASC",
-        "stock_desc": "p.stock DESC",
-        "stock_asc": "p.stock ASC",
-    }
-    order_sql = order_map.get(sort_by, "p.sku COLLATE NOCASE ASC")
-
-    base_from = """
-        FROM products p
-        LEFT JOIN sku_master sm ON sm.sku = p.sku
-    """
-    count_sql = f"SELECT COUNT(*) AS cnt {base_from} WHERE {where_sql}"
-    data_sql = f"""
-        SELECT p.id, p.sku, p.name, p.frame_color, p.lens_color, p.gender, p.palette, p.style,
-               p.stock, p.created_at,
-               COALESCE(sm.avg_unit_cost, p.cost, 0) AS avg_cost,
-               COALESCE(sm.selling_price, p.price, 0) AS sell_price
-        {base_from}
-        WHERE {where_sql}
-        ORDER BY {order_sql}
-        LIMIT ? OFFSET ?
-    """
-    lim = max(1, min(int(limit), 500))
-    off = max(0, int(offset))
-    with get_conn() as conn:
-        total = int(conn.execute(count_sql, params).fetchone()["cnt"])
-        rows = conn.execute(data_sql, params + [lim, off]).fetchall()
-    return rows, total
-
-
-def format_product_created_display(iso_val: Optional[str]) -> str:
-    """Format products.created_at (ISO) for tables; legacy rows may be empty."""
-    if iso_val is None:
-        return "—"
-    s = str(iso_val).strip()
-    if not s:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return s
-
-
-def fetch_product_by_id(product_id: int):
-    """Single product row joined with sku_master for display."""
-    with get_conn() as conn:
-        return conn.execute(
-            """
-            SELECT p.id, p.sku, p.name, p.frame_color, p.lens_color, p.gender, p.palette, p.style,
-                   p.stock, p.registered_date, p.product_enter_code, p.created_at,
-                   COALESCE(sm.avg_unit_cost, p.cost, 0) AS avg_cost,
-                   COALESCE(sm.selling_price, p.price, 0) AS sell_price
-            FROM products p
-            LEFT JOIN sku_master sm ON sm.sku = p.sku
-            WHERE p.id = ?;
-            """,
-            (int(product_id),),
-        ).fetchone()
-
-
-def add_product(
-    name: str,
-    stock: float,
-    registered_date,
-    frame_color: str,
-    lens_color: str,
-    style: str,
-    palette: str,
-    gender: str,
-    unit_cost: float,
-) -> str:
-    """
-    Registra um lote. SKU: [SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST].
-
-    Product registration typically uses stock=0; add stock via the Costing page (stock receipts).
-    If stock > 0 here, unit_cost must be > 0 (weighted-average receipt).
-
-    Não insere novo lote se já existir lote com o mesmo nome + data + atributos, nem se já existir
-    o mesmo corpo de SKU (atributos), ignorando apenas o prefixo numérico SEQ.
-
-    Returns the product enter code (slug + date). Raises ValueError or sqlite errors if not mergeable / DB fails.
-    """
-    product_enter_code = make_product_enter_code(product_name=name, registered_date=registered_date)
-    name = name.strip()
-    frame_color = (frame_color or "").strip()
-    lens_color = (lens_color or "").strip()
-    style = (style or "").strip()
-    palette = (palette or "").strip()
-    gender = (gender or "").strip()
-
-    if float(stock) > 0 and float(unit_cost) <= 0:
-        raise ValueError(
-            "Com estoque maior que zero, o custo unitário é obrigatório e deve ser maior que zero."
-        )
-    if float(stock) < 0:
-        raise ValueError("O estoque não pode ser negativo.")
-
-    with get_conn() as conn:
-        conn.isolation_level = None
-        try:
-            conn.execute("BEGIN IMMEDIATE;")
-            registered_date_text = registered_date.isoformat()
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM products
-                WHERE name = ? AND registered_date = ?
-                  AND COALESCE(frame_color, '') = ?
-                  AND COALESCE(lens_color, '') = ?
-                  AND COALESCE(style, '') = ?
-                  AND COALESCE(palette, '') = ?
-                  AND COALESCE(gender, '') = ?;
-                """,
-                (
-                    name,
-                    registered_date_text,
-                    frame_color,
-                    lens_color,
-                    style,
-                    palette,
-                    gender,
-                ),
-            ).fetchone()
-
-            if existing is not None:
-                # Mesmo lote (nome + data + atributos): não re-cadastrar; evita "sucesso" sem linha nova.
-                raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
-            else:
-                body = build_product_sku_body(
-                    name, frame_color, lens_color, gender, palette, style
-                )
-                if sku_base_body_exists(conn, body):
-                    raise ValueError(DUPLICATE_SKU_BASE_ERROR_MSG)
-                n = _next_sku_sequence(conn)
-                sku = f"{format_sku_sequence_int(n)}-{body}"
-                clash = conn.execute(
-                    "SELECT id FROM products WHERE sku = ?;",
-                    (sku,),
-                ).fetchone()
-                if clash is not None:
-                    raise ValueError(
-                        f"O SKU `{sku}` já existe (duplicado). "
-                        "Use outro nome de produto ou ajuste os atributos para o SKU ser único."
-                    )
-                created_now = datetime.now().isoformat(timespec="seconds")
-                ins_cur = conn.execute(
-                    """
-                    INSERT INTO products (
-                        name, sku, registered_date, product_enter_code, cost, price, stock,
-                        frame_color, lens_color, style, palette, gender, created_at
-                    )
-                    VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        name,
-                        sku,
-                        registered_date_text,
-                        product_enter_code,
-                        frame_color,
-                        lens_color,
-                        style,
-                        palette,
-                        gender,
-                        created_now,
-                    ),
-                )
-                pid = int(ins_cur.lastrowid)
-                if float(stock) > 0:
-                    ensure_sku_master(conn, sku)
-                    apply_stock_receipt(conn, sku, pid, float(stock), float(unit_cost))
-                else:
-                    ensure_sku_master(conn, sku)
-            conn.execute("COMMIT;")
-        except Exception:
-            _sqlite_safe_rollback(conn)
-            raise
-    return product_enter_code
-
-
-def set_product_pricing(product_id: int, cost: float, price: float) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE products
-            SET cost = ?, price = ?
-            WHERE id = ?;
-            """,
-            (cost, price, product_id),
-        )
-
-
-def set_product_pricing_for_batch(
-    product_name: str,
-    sku: str,
-    registered_date_text: str,
-    cost: float,
-    price: float,
-) -> int:
-    """
-    Freeze cost/price for all rows that belong to the same "batch":
-    (product name + registered date + SKU) and still have stock in inventory.
-
-    - cost: subtotal cost from the pricing worksheet (sum of lines).
-    - price: **final unit price** from pricing (incl. markup, taxes & interest) — used for Sales and stock value.
-
-    Returns how many product rows were updated.
-    """
-    with get_conn() as conn:
-        # If there's already a priced in-stock batch for this code,
-        # we must not overwrite it (unless the batch was excluded from stock/reset).
-        locked = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM products
-            WHERE name = ?
-              AND sku = ?
-              AND registered_date = ?
-              AND stock > 0
-              AND pricing_locked = 1;
-            """,
-            (product_name, sku, registered_date_text),
-        ).fetchone()["cnt"]
-
-        if int(locked) > 0:
-            return -1
-
-        cur = conn.execute(
-            """
-            UPDATE products
-            SET cost = ?,
-                price = ?,
-                pricing_locked = 1
-            WHERE name = ?
-              AND sku = ?
-              AND registered_date = ?
-              AND stock > 0;
-            """,
-            (cost, price, product_name, sku, registered_date_text),
-        )
-        return int(cur.rowcount or 0)
-
-
-def reset_batch_pricing_and_exclude(product_enter_code: str) -> int:
-    """
-    Exclude the batch from stock and clear its pricing so it can be repriced later.
-    Syncs SKU-level total_stock after stock is cleared.
-    """
-    with get_conn() as conn:
-        skus = [
-            str(r["sku"]).strip()
-            for r in conn.execute(
-                """
-                SELECT DISTINCT sku FROM products
-                WHERE product_enter_code = ? AND sku IS NOT NULL AND TRIM(sku) != '';
-                """,
-                (product_enter_code,),
-            ).fetchall()
-        ]
-        cur = conn.execute(
-            """
-            UPDATE products
-            SET stock = 0,
-                cost = 0,
-                price = 0,
-                pricing_locked = 0
-            WHERE product_enter_code = ?;
-            """,
-            (product_enter_code,),
-        )
-        n = int(cur.rowcount or 0)
-        for sku in skus:
-            sync_sku_master_totals(conn, sku)
-        return n
-
-
-def clear_batch_pricing_only(product_enter_code: str) -> int:
-    """Clear cost/price only (keep stock as-is) for the given entering code."""
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            UPDATE products
-            SET cost = 0,
-                price = 0,
-                pricing_locked = 0
-            WHERE product_enter_code = ?;
-            """,
-            (product_enter_code,),
-        )
-        return int(cur.rowcount or 0)
-
-
-def record_sale(
-    product_id: int,
-    quantity: int,
-    customer_id: int,
-    discount_amount: float,
-) -> Tuple[str, float]:
-    """
-    Atomically:
-    - validate customer exists
-    - read SKU selling price from sku_master and WAC (COGS)
-    - verify stock >= quantity
-    - update stock and sku_master totals (WAC unchanged on sale)
-    - allocate sequential sale_code (#####V) and insert full sale row
-
-    Returns (sale_code, final_total_after_discount).
-    """
-    qty = int(quantity)
-    if qty < 1:
-        raise ValueError("A quantidade deve ser maior que zero.")
-    disc = float(discount_amount)
-    if disc < 0:
-        raise ValueError("O desconto não pode ser negativo.")
-
-    with get_conn() as conn:
-        conn.isolation_level = None
-        try:
-            conn.execute("BEGIN IMMEDIATE;")
-            cust = conn.execute(
-                "SELECT id FROM customers WHERE id = ?;",
-                (int(customer_id),),
-            ).fetchone()
-            if cust is None:
-                raise ValueError("Cliente não encontrado.")
-
-            row = conn.execute(
-                """
-                SELECT p.stock, p.sku, p.deleted_at AS p_del,
-                       sm.deleted_at AS sm_del,
-                       COALESCE(sm.selling_price, 0) AS sp,
-                       COALESCE(sm.avg_unit_cost, 0) AS avg_cogs
-                FROM products p
-                LEFT JOIN sku_master sm ON sm.sku = p.sku
-                WHERE p.id = ?;
-                """,
-                (product_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError("Produto não encontrado.")
-            if row["p_del"] or row["sm_del"]:
-                raise ValueError(
-                    "Este produto/SKU está inativo (excluído logicamente) e não pode ser vendido."
-                )
-
-            sku = (row["sku"] or "").strip()
-            if not sku:
-                raise ValueError("O produto não tem SKU; não é possível registrar a venda.")
-
-            selling_price = float(row["sp"])
-            if selling_price <= 0:
-                raise ValueError(
-                    "Defina um preço de venda para este SKU em Precificação antes de vender."
-                )
-
-            stock = float(row["stock"] or 0)
-            gross_total = selling_price * float(qty)
-
-            if float(qty) > stock + 1e-9:
-                raise ValueError(f"Estoque insuficiente. Disponível: {stock}")
-
-            if disc > gross_total + 1e-9:
-                raise ValueError(
-                    "O desconto não pode exceder o valor base (preço unitário × quantidade)."
-                )
-
-            final_total = gross_total - disc
-            avg_cogs = float(row["avg_cogs"])
-            cogs_total = float(qty) * avg_cogs
-
-            conn.execute(
-                "UPDATE products SET stock = stock - ? WHERE id = ?;",
-                (qty, product_id),
-            )
-            sync_sku_master_totals(conn, sku)
-
-            seq_n = _next_sale_sequence(conn)
-            sale_code = format_sale_code(seq_n)
-
-            conn.execute(
-                """
-                INSERT INTO sales (
-                    sale_code, product_id, customer_id, quantity, unit_price, discount_amount,
-                    base_amount, total, sold_at, sku, cogs_total
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    sale_code,
-                    product_id,
-                    int(customer_id),
-                    qty,
-                    selling_price,
-                    disc,
-                    gross_total,
-                    final_total,
-                    datetime.now().isoformat(timespec="seconds"),
-                    sku,
-                    cogs_total,
-                ),
-            )
-            conn.execute("COMMIT;")
-            return sale_code, final_total
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
-
-
-def compute_dashboard():
-    with get_conn() as conn:
-        revenue = conn.execute("SELECT COALESCE(SUM(total), 0) AS revenue FROM sales;").fetchone()[
-            "revenue"
-        ]
-        sales_count = conn.execute("SELECT COUNT(*) AS cnt FROM sales;").fetchone()["cnt"]
-        total_stock_units = float(
-            conn.execute("SELECT COALESCE(SUM(stock), 0) AS cnt FROM products;").fetchone()["cnt"]
-        )
-        low_stock = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM products
-            WHERE stock <= 5
-            """
-        ).fetchone()["cnt"]
-
-    return {
-        "revenue": float(revenue),
-        "sales_count": int(sales_count),
-        "total_stock_units": total_stock_units,
-        "low_stock": int(low_stock),
-    }
-
-
-def compute_sales_financials():
-    """
-    Financial summary based strictly on recorded sales:
-    - revenue: SUM(sales.total)
-    - cost: SUM(sales.cogs_total) — COGS at sale time (SKU weighted-average cost × qty)
-    - profit/loss: revenue - cost
-    """
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT
-                COALESCE(SUM(s.total), 0) AS revenue,
-                COALESCE(SUM(s.cogs_total), 0) AS cost
-            FROM sales s;
-            """
-        ).fetchone()
-
-    revenue = float(row["revenue"])
-    cost = float(row["cost"])
-    profit_loss = revenue - cost
-    return revenue, cost, profit_loss
-
-
-def fetch_revenue_timeseries():
-    """Revenue aggregated by day (for the dashboard chart)."""
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                DATE(sold_at) AS day,
-                SUM(total) AS revenue
-            FROM sales
-            GROUP BY day
-            ORDER BY day;
-            """
-        ).fetchall()
-
-    if not rows:
-        return pd.DataFrame(columns=["day", "revenue"])
-
-    df = pd.DataFrame([{"day": r["day"], "revenue": r["revenue"]} for r in rows])
-    df["revenue"] = df["revenue"].astype(float)
-    return df
-
-
 def _maybe_sidebar_database_export() -> None:
     """
     Quando `allow_database_export` está definido em Streamlit Secrets (ex.: Cloud),
-    mostra um botão para descarregar o SQLite ativo (`DB_PATH`) — útil no Cloud para backup.
+    mostra um botão para descarregar o SQLite ativo — útil no Cloud para backup.
     Desativar o segredo logo após o download.
     """
     try:
@@ -1839,152 +393,300 @@ def _maybe_sidebar_database_export() -> None:
         allow = allow.strip().lower() in ("1", "true", "yes", "on")
     if not bool(allow):
         return
+    db_path = get_sqlite_db_path()
     with st.sidebar.expander("Backup do banco (admin)", expanded=False):
         st.caption(
             "Descarregue o SQLite uma vez e desative o segredo `allow_database_export` no painel do Streamlit."
         )
-        if DB_PATH.is_file():
-            _db_leaf = DB_PATH.name
+        if db_path.is_file():
+            _db_leaf = db_path.name
+            if not is_admin():
+                st.caption("Apenas o perfil **administrador** pode descarregar o ficheiro.")
             st.download_button(
                 f"Descarregar {_db_leaf}",
-                data=DB_PATH.read_bytes(),
+                data=db_path.read_bytes(),
                 file_name=_db_leaf,
                 mime="application/octet-stream",
                 key="alieh_export_sqlite_db",
+                disabled=not is_admin(),
+                help=(
+                    "Restrito a administradores."
+                    if not is_admin()
+                    else "Transferência única do SQLite ativo (tenant atual)."
+                ),
             )
         else:
             st.warning("Ficheiro de base de dados não encontrado neste ambiente.")
 
 
+def _render_uat_manual_checklist_page() -> None:
+    """Checklist interactivo UAT (secção A.4); persistência por inquilino em SQLite."""
+    require_operator_or_admin()
+    st.markdown("### Checklist UAT manual")
+    st.caption(
+        "Formalização da validação de negócio (relatório UAT, secção A.4). "
+        "Grave cada caso após executar o teste na aplicação; os registos ficam na base SQLite "
+        "do inquilino actual e entram nas exportações de auditoria quando configuradas."
+    )
+    tid = effective_tenant_id_for_request()
+    db_map = fetch_map_for_tenant(tid)
+
+    for code, _title, _desc in UAT_MANUAL_CASES:
+        k_s = f"uat_stat_{code}"
+        k_n = f"uat_notes_{code}"
+        if k_s not in st.session_state:
+            row = db_map.get(code)
+            raw_st = (row.get("status") if row else None) or "pending"
+            st.session_state[k_s] = (
+                raw_st if raw_st in UAT_STATUS_ORDER else "pending"
+            )
+        if k_n not in st.session_state:
+            st.session_state[k_n] = (db_map.get(code) or {}).get("notes") or ""
+
+    n_total = len(UAT_MANUAL_CASES)
+    n_done = sum(
+        1
+        for c, _, __ in UAT_MANUAL_CASES
+        if st.session_state.get(f"uat_stat_{c}", "pending") != "pending"
+    )
+    st.progress(
+        n_done / n_total if n_total else 0.0,
+        text=f"{n_done} de {n_total} casos com resultado registado (não pendente)",
+    )
+
+    summary_rows = []
+    for code, title, _desc in UAT_MANUAL_CASES:
+        row = db_map.get(code)
+        bst = str((row or {}).get("status") or "pending")
+        summary_rows.append(
+            {
+                "ID": code,
+                "Caso": title,
+                "Estado (último gravado na BD)": UAT_STATUS_LABELS.get(bst, bst),
+                "Data/hora registo": (row or {}).get("result_recorded_at") or "—",
+                "Actualizado (BD)": (row or {}).get("updated_at") or "—",
+                "Utilizador": (row or {}).get("recorded_by_username") or "—",
+                "Perfil": (row or {}).get("recorded_by_role") or "—",
+            }
+        )
+    st.dataframe(summary_rows, width="stretch", hide_index=True)
+
+    st.divider()
+    for code, title, desc in UAT_MANUAL_CASES:
+        row = db_map.get(code)
+        with st.expander(f"{code} — {title}", expanded=False):
+            st.markdown(desc)
+            st.selectbox(
+                "Resultado",
+                options=list(UAT_STATUS_ORDER),
+                format_func=lambda x: UAT_STATUS_LABELS[x],
+                key=f"uat_stat_{code}",
+            )
+            st.text_area("Notas (opcional)", key=f"uat_notes_{code}", height=72)
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                save = st.button("Gravar resultado", type="primary", key=f"uat_save_{code}")
+            with c2:
+                if row and (row.get("result_recorded_at") or row.get("updated_at")):
+                    st.caption(
+                        "Último registo gravado: **"
+                        f"{(row.get('result_recorded_at') or row.get('updated_at') or '—')}"
+                        "** — utilizador **"
+                        f"{(row.get('recorded_by_username') or '—')}**"
+                    )
+            if save:
+                status = st.session_state.get(f"uat_stat_{code}", "pending")
+                notes = str(st.session_state.get(f"uat_notes_{code}", "") or "")
+                upsert_uat_record(
+                    tid,
+                    code,
+                    status,
+                    notes,
+                    username=get_audit_session_user(),
+                    user_id=get_audit_session_user_id(),
+                    role=(get_session_user_role() or "—"),
+                )
+                log_critical_event(
+                    "UAT_MANUAL_CHECKLIST_SAVE",
+                    test_id=code,
+                    status=status,
+                )
+                st.success(f"**{code}** gravado na base de dados.")
+                st.rerun()
+
+
 def main():
     st.set_page_config(page_title="ALIEH — Gestão", layout="wide")
-    init_db()
+    run_database_init()
+    register_sqlite_full_backup_atexit()
+    run_startup_sqlite_full_backup_once()
+    maybe_run_periodic_maintenance_backups()
+    maybe_run_periodic_database_health()
+    ensure_authenticated_or_stop()
 
-    # Responsive app shell: flex row (sidebar + main). Collapsed sidebar → main uses full width.
+    # Shell + tipografia. O primeiro caractere do markdown deve ser «<» — indentação à esquerda
+    # no `st.markdown` vira bloco de código e o CSS aparece como texto na página.
     st.markdown(
-        """
-        <style>
-        /* App shell: flex layout (not fixed positioning) */
-        [data-testid="stAppViewContainer"] {
-            width: 100% !important;
-            max-width: 100vw !important;
-            box-sizing: border-box !important;
-        }
-
-        [data-testid="stAppViewContainer"] > div {
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-
-        /* Row that holds sidebar + main */
-        [data-testid="stAppViewContainer"] > div:has(> section[data-testid="stSidebar"]) {
-            display: flex !important;
-            flex-direction: row !important;
-            align-items: stretch !important;
-            width: 100% !important;
-            min-width: 0 !important;
-            flex: 1 1 auto !important;
-        }
-
-        /* Sidebar expanded — 240px track */
-        section[data-testid="stSidebar"] {
-            flex: 0 0 240px !important;
-            width: 240px !important;
-            min-width: 240px !important;
-            max-width: 240px !important;
-            box-sizing: border-box !important;
-            position: relative !important;
-        }
-
-        section[data-testid="stSidebar"] > div {
-            width: 100% !important;
-        }
-
-        /* Sidebar collapsed — no layout width (Streamlit sets aria-expanded + translateX) */
-        section[data-testid="stSidebar"][aria-expanded="false"] {
-            flex: 0 0 0 !important;
-            width: 0 !important;
-            min-width: 0 !important;
-            max-width: 0 !important;
-            overflow: visible !important;
-            border: none !important;
-            padding: 0 !important;
-        }
-
-        /* Main content: grows to fill remaining space */
-        section.main,
-        [data-testid="stMain"] {
-            flex: 1 1 0% !important;
-            min-width: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-            margin-left: 0 !important;
-            box-sizing: border-box !important;
-        }
-
-        /* Collapsed sidebar: remove phantom left inset; stretch edge-to-edge */
-        section[data-testid="stSidebar"][aria-expanded="false"] ~ section.main,
-        section[data-testid="stSidebar"][aria-expanded="false"] ~ [data-testid="stMain"] {
-            margin-left: 0 !important;
-            padding-left: 0.75rem !important;
-            max-width: 100% !important;
-        }
-
-        section.main .block-container,
-        [data-testid="stMain"] .block-container {
-            max-width: 100% !important;
-            margin-left: 0 !important;
-            padding-left: 1rem !important;
-            padding-right: 1rem !important;
-            box-sizing: border-box !important;
-        }
-
-        section[data-testid="stSidebar"][aria-expanded="false"] ~ section.main .block-container,
-        section[data-testid="stSidebar"][aria-expanded="false"] ~ [data-testid="stMain"] .block-container {
-            padding-left: 0.75rem !important;
-            padding-right: 0.75rem !important;
-        }
-
-        /* Fallback: Streamlit collapses with translateX(-Npx) on the sidebar */
-        section[data-testid="stSidebar"][style*="translateX(-"] {
-            flex: 0 0 0 !important;
-            width: 0 !important;
-            min-width: 0 !important;
-            max-width: 0 !important;
-            overflow: visible !important;
-            padding: 0 !important;
-        }
-        section[data-testid="stSidebar"][style*="translateX(-"] ~ section.main,
-        section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"] {
-            margin-left: 0 !important;
-            padding-left: 0.75rem !important;
-            max-width: 100% !important;
-        }
-        section[data-testid="stSidebar"][style*="translateX(-"] ~ section.main .block-container,
-        section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"] .block-container {
-            padding-left: 0.75rem !important;
-            padding-right: 0.75rem !important;
-        }
-        </style>
-        """,
+        """<style>
+@import url("https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700&display=swap");
+/* Tipografia ALIEH: sans-serif única em toda a app (sidebar, painel e páginas). */
+:root {
+  --alieh-font-ui: "Montserrat", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+html, body,
+.stApp,
+section.main,
+[data-testid="stMain"],
+[data-testid="stMain"] .block-container {
+  font-family: var(--alieh-font-ui) !important;
+}
+section.main h1, section.main h2,
+[data-testid="stMain"] h1,
+[data-testid="stMain"] h2 {
+  font-family: var(--alieh-font-ui) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em !important;
+  line-height: 1.2 !important;
+}
+section.main h3, section.main h4, section.main h5, section.main h6,
+[data-testid="stMain"] h3,
+[data-testid="stMain"] h4,
+[data-testid="stMain"] h5,
+[data-testid="stMain"] h6 {
+  font-family: var(--alieh-font-ui) !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.015em !important;
+  line-height: 1.3 !important;
+}
+section[data-testid="stSidebar"] {
+  font-family: var(--alieh-font-ui) !important;
+}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+  font-family: var(--alieh-font-ui) !important;
+  letter-spacing: 0.02em !important;
+}
+.stButton > button,
+.stDownloadButton > button,
+[data-testid="baseButton-secondary"],
+[data-testid="baseButton-primary"] {
+  font-family: var(--alieh-font-ui) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.05em !important;
+  text-transform: none !important;
+}
+[data-testid="stAppViewContainer"] {
+  width: 100% !important;
+  max-width: 100vw !important;
+  box-sizing: border-box !important;
+}
+[data-testid="stAppViewContainer"] > div {
+  width: 100% !important;
+  max-width: 100% !important;
+}
+[data-testid="stAppViewContainer"] > div:has(> section[data-testid="stSidebar"]) {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: stretch !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  flex: 1 1 auto !important;
+}
+section[data-testid="stSidebar"] {
+  flex: 0 0 240px !important;
+  width: 240px !important;
+  min-width: 240px !important;
+  max-width: 240px !important;
+  box-sizing: border-box !important;
+  position: relative !important;
+}
+section[data-testid="stSidebar"] > div {
+  width: 100% !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] {
+  flex: 0 0 0 !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  overflow: visible !important;
+  border: none !important;
+  padding: 0 !important;
+}
+section.main,
+[data-testid="stMain"] {
+  flex: 1 1 0% !important;
+  min-width: 0 !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  margin-left: 0 !important;
+  box-sizing: border-box !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] ~ section.main,
+section[data-testid="stSidebar"][aria-expanded="false"] ~ [data-testid="stMain"] {
+  margin-left: 0 !important;
+  padding-left: 0.75rem !important;
+  max-width: 100% !important;
+}
+section.main .block-container,
+[data-testid="stMain"] .block-container {
+  max-width: 100% !important;
+  margin-left: 0 !important;
+  padding-left: 1rem !important;
+  padding-right: 1rem !important;
+  box-sizing: border-box !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] ~ section.main .block-container,
+section[data-testid="stSidebar"][aria-expanded="false"] ~ [data-testid="stMain"] .block-container {
+  padding-left: 0.75rem !important;
+  padding-right: 0.75rem !important;
+}
+section[data-testid="stSidebar"][style*="translateX(-"] {
+  flex: 0 0 0 !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  overflow: visible !important;
+  padding: 0 !important;
+}
+section[data-testid="stSidebar"][style*="translateX(-"] ~ section.main,
+section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"] {
+  margin-left: 0 !important;
+  padding-left: 0.75rem !important;
+  max-width: 100% !important;
+}
+section[data-testid="stSidebar"][style*="translateX(-"] ~ section.main .block-container,
+section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"] .block-container {
+  padding-left: 0.75rem !important;
+  padding-right: 0.75rem !important;
+}
+</style>""",
         unsafe_allow_html=True,
     )
 
     st.title("ALIEH — Gestão comercial")
     st.caption(
-        "Produtos, estoque, custos, precificação, vendas e painel (banco SQLite local)."
+        "Produtos, custos, precificação, estoque, clientes, vendas e painel (banco SQLite local)."
     )
+
+    if is_auth_configured() and st.sidebar.button("Sair", key="alieh_logout_btn"):
+        logout()
+        st.rerun()
+
+    if is_auth_configured():
+        st.sidebar.caption(f"Inquilino: `{get_session_tenant_id()}`")
 
     page = st.sidebar.radio(
         "Navegação",
         [
+            PAGE_PAINEL,
             PAGE_PRODUTOS,
-            PAGE_ESTOQUE,
             PAGE_CUSTOS,
             PAGE_PRECIFICACAO,
-            PAGE_VENDAS,
+            PAGE_ESTOQUE,
             PAGE_CLIENTES,
-            PAGE_PAINEL,
+            PAGE_VENDAS,
+            PAGE_UAT,
         ],
         index=0,
     )
@@ -2122,6 +824,12 @@ def main():
                 pick_labels = [
                     f"{r['id']}  |  {r['sku'] or '—'}  |  {r['name'] or '—'}" for r in rows
                 ]
+                # Reset do detalhe deve ocorrer *antes* do selectbox (Streamlit proíbe alterar a key após o widget).
+                if st.session_state.pop("_reset_sku_search_product_focus", False):
+                    st.session_state["sku_search_product_focus"] = "—"
+                _sku_del_ok = st.session_state.pop("_sku_deleted_ok_msg", None)
+                if _sku_del_ok:
+                    st.success(_sku_del_ok)
                 pick = st.selectbox(
                     "Selecionar produto (detalhes)",
                     ["—"] + pick_labels,
@@ -2136,27 +844,290 @@ def main():
                             f"Produto **ID `{pr['id']}`** — SKU `{pr['sku'] or '—'}`."
                         )
                         with st.container(border=True):
-                            st.markdown(
-                                f"- **SKU:** `{pr['sku'] or '—'}`\n"
-                                f"- **Nome:** {pr['name']}\n"
-                                f"- **Cor armação · Cor lente · Gênero · Paleta · Estilo:** "
-                                f"{pr['frame_color'] or '—'} · {pr['lens_color'] or '—'} · "
-                                f"{pr['gender'] or '—'} · "
-                                f"{pr['palette'] or '—'} · {pr['style'] or '—'}\n"
-                                f"- **Estoque:** {format_qty_display_4(float(pr['stock'] or 0))}\n"
-                                f"- **Custo médio (SKU):** {format_money(float(pr['avg_cost'] or 0))}\n"
-                                f"- **Preço (SKU):** {format_money(float(pr['sell_price'] or 0))}\n"
-                                f"- **Código de entrada:** {pr['product_enter_code'] or '—'}\n"
-                                f"- **Cadastro (registro):** "
-                                f"{format_product_created_display(pr['created_at'])}"
-                            )
+                            _pic_col, _det_col = st.columns([1, 1])
+                            with _pic_col:
+                                _abs_img = product_image_abs_path(pr["product_image_path"])
+                                if _abs_img is not None:
+                                    st.image(
+                                        str(_abs_img),
+                                        caption="Foto do produto",
+                                        use_container_width=True,
+                                    )
+                                else:
+                                    st.caption("Sem foto cadastrada.")
+                            with _det_col:
+                                st.markdown(
+                                    f"- **SKU:** `{pr['sku'] or '—'}`\n"
+                                    f"- **Nome:** {pr['name']}\n"
+                                    f"- **Cor armação · Cor lente · Gênero · Paleta · Estilo:** "
+                                    f"{pr['frame_color'] or '—'} · {pr['lens_color'] or '—'} · "
+                                    f"{pr['gender'] or '—'} · "
+                                    f"{pr['palette'] or '—'} · {pr['style'] or '—'}\n"
+                                    f"- **Estoque:** {format_qty_display_4(float(pr['stock'] or 0))}\n"
+                                    f"- **Custo médio (SKU):** {format_money(float(pr['avg_cost'] or 0))}\n"
+                                    f"- **Preço (SKU):** {format_money(float(pr['sell_price'] or 0))}\n"
+                                    f"- **Código de entrada:** {pr['product_enter_code'] or '—'}\n"
+                                    f"- **Cadastro (registro):** "
+                                    f"{format_product_created_display(pr['created_at'])}"
+                                )
                             st.caption(
                                 "Use este SKU em **Estoque**, **Custos**, **Precificação** e **Vendas**."
                             )
 
+                            lot_edit_block = product_lot_edit_block_reason(focus_id)
+                            with st.expander("Editar produto", expanded=False):
+                                st.markdown("##### Foto do produto")
+                                st.caption(
+                                    "A foto pode ser **substituída a qualquer momento**, mesmo com "
+                                    "estoque, custo, preço ou vendas."
+                                )
+                                st.file_uploader(
+                                    "Nova imagem (JPG, PNG ou WebP)",
+                                    type=["jpg", "jpeg", "png", "webp"],
+                                    accept_multiple_files=False,
+                                    key=f"prod_edit_photo_{focus_id}",
+                                    disabled=not is_admin(),
+                                )
+                                if st.button(
+                                    "Gravar nova foto",
+                                    key=f"prod_edit_photo_btn_{focus_id}",
+                                    disabled=not is_admin(),
+                                    help="Apenas administradores." if not is_admin() else None,
+                                ):
+                                    require_admin()
+                                    _uf = st.session_state.get(f"prod_edit_photo_{focus_id}")
+                                    if _uf is None:
+                                        st.error("Selecione um ficheiro.")
+                                    else:
+                                        try:
+                                            update_product_lot_photo(
+                                                focus_id,
+                                                _uf.getvalue(),
+                                                getattr(_uf, "name", None) or "foto.jpg",
+                                            )
+                                        except ValueError as _e:
+                                            st.error(str(_e))
+                                        else:
+                                            st.success("Foto atualizada.")
+                                            st.rerun()
+
+                                st.divider()
+                                st.markdown("##### Nome, data e atributos")
+                                if lot_edit_block:
+                                    st.info(lot_edit_block)
+                                else:
+                                    frame_opts_e = list(
+                                        dropdown_with_other(PRODUCT_FRAME_COLOR_OPTIONS)
+                                    )
+                                    lens_opts_e = list(
+                                        dropdown_with_other(PRODUCT_LENS_COLOR_OPTIONS)
+                                    )
+                                    palette_opts_e = list(
+                                        dropdown_with_other(PRODUCT_PALETTE_OPTIONS)
+                                    )
+                                    gender_opts_e = list(
+                                        dropdown_with_other(PRODUCT_GENDER_OPTIONS)
+                                    )
+                                    style_opts_e = list(
+                                        dropdown_with_other(PRODUCT_STYLE_OPTIONS)
+                                    )
+                                    for _opts, _col in (
+                                        (frame_opts_e, pr["frame_color"]),
+                                        (lens_opts_e, pr["lens_color"]),
+                                        (palette_opts_e, pr["palette"]),
+                                        (gender_opts_e, pr["gender"]),
+                                        (style_opts_e, pr["style"]),
+                                    ):
+                                        _vv = (_col or "").strip()
+                                        if _vv and _vv not in _opts:
+                                            _opts.insert(0, _vv)
+
+                                    if st.session_state.get("prod_edit_init_id") != focus_id:
+                                        st.session_state["prod_edit_init_id"] = focus_id
+                                        try:
+                                            _erd = datetime.fromisoformat(
+                                                str(pr["registered_date"]).split("T")[0][:10]
+                                            ).date()
+                                        except (ValueError, TypeError):
+                                            _erd = date.today()
+                                        st.session_state[f"prod_edit_name_{focus_id}"] = (
+                                            pr["name"] or ""
+                                        )
+                                        st.session_state[f"prod_edit_date_{focus_id}"] = _erd
+
+                                        def _pick_edit_opt(val, opts):
+                                            v = (val or "").strip()
+                                            if v and v in opts:
+                                                return v
+                                            return opts[0] if opts else ""
+
+                                        st.session_state[f"prod_edit_frame_{focus_id}"] = (
+                                            _pick_edit_opt(pr["frame_color"], frame_opts_e)
+                                        )
+                                        st.session_state[f"prod_edit_lens_{focus_id}"] = (
+                                            _pick_edit_opt(pr["lens_color"], lens_opts_e)
+                                        )
+                                        st.session_state[f"prod_edit_pal_{focus_id}"] = (
+                                            _pick_edit_opt(pr["palette"], palette_opts_e)
+                                        )
+                                        st.session_state[f"prod_edit_gen_{focus_id}"] = (
+                                            _pick_edit_opt(pr["gender"], gender_opts_e)
+                                        )
+                                        st.session_state[f"prod_edit_sty_{focus_id}"] = (
+                                            _pick_edit_opt(pr["style"], style_opts_e)
+                                        )
+
+                                    with st.form(f"prod_edit_lot_form_{focus_id}"):
+                                        st.text_input(
+                                            "Nome do produto",
+                                            key=f"prod_edit_name_{focus_id}",
+                                        )
+                                        st.date_input(
+                                            "Data de registro",
+                                            key=f"prod_edit_date_{focus_id}",
+                                        )
+                                        st.selectbox(
+                                            "Cor da armação",
+                                            options=frame_opts_e,
+                                            key=f"prod_edit_frame_{focus_id}",
+                                        )
+                                        st.selectbox(
+                                            "Cor da lente",
+                                            options=lens_opts_e,
+                                            key=f"prod_edit_lens_{focus_id}",
+                                        )
+                                        st.selectbox(
+                                            "Paleta",
+                                            options=palette_opts_e,
+                                            key=f"prod_edit_pal_{focus_id}",
+                                        )
+                                        st.selectbox(
+                                            "Gênero",
+                                            options=gender_opts_e,
+                                            key=f"prod_edit_gen_{focus_id}",
+                                        )
+                                        st.selectbox(
+                                            "Estilo",
+                                            options=style_opts_e,
+                                            key=f"prod_edit_sty_{focus_id}",
+                                        )
+                                        _save_lot = st.form_submit_button(
+                                            "Salvar alterações nos dados do lote",
+                                            disabled=not is_admin(),
+                                        )
+                                    if _save_lot:
+                                        require_admin()
+                                        _nm = (
+                                            st.session_state.get(
+                                                f"prod_edit_name_{focus_id}", ""
+                                            )
+                                            or ""
+                                        ).strip()
+                                        if not _nm:
+                                            st.error("O nome é obrigatório.")
+                                        else:
+                                            try:
+                                                update_product_lot_attributes(
+                                                    focus_id,
+                                                    name=_nm,
+                                                    registered_date=st.session_state[
+                                                        f"prod_edit_date_{focus_id}"
+                                                    ],
+                                                    frame_color=st.session_state[
+                                                        f"prod_edit_frame_{focus_id}"
+                                                    ],
+                                                    lens_color=st.session_state[
+                                                        f"prod_edit_lens_{focus_id}"
+                                                    ],
+                                                    style=st.session_state[
+                                                        f"prod_edit_sty_{focus_id}"
+                                                    ],
+                                                    palette=st.session_state[
+                                                        f"prod_edit_pal_{focus_id}"
+                                                    ],
+                                                    gender=st.session_state[
+                                                        f"prod_edit_gen_{focus_id}"
+                                                    ],
+                                                )
+                                            except ValueError as _e:
+                                                st.error(str(_e))
+                                            else:
+                                                st.success(
+                                                    "Dados do lote atualizados (e SKU ajustado, se necessário)."
+                                                )
+                                                st.session_state.pop(
+                                                    "prod_edit_init_id", None
+                                                )
+                                                st.rerun()
+
+                            sku_key = (pr["sku"] or "").strip()
+                            block = (
+                                sku_correction_block_reason(sku_key)
+                                if sku_key
+                                else "SKU inválido."
+                            )
+                            if block:
+                                st.info(block)
+                            else:
+                                st.caption(
+                                    "Sem estoque, custos, preços ou vendas para este SKU — "
+                                    "pode **excluir definitivamente** o cadastro (irreversível)."
+                                )
+
+                            delete_disabled = bool(block) or not is_admin()
+                            if st.button(
+                                "Excluir SKU",
+                                key=f"prod_sku_delete_{focus_id}",
+                                disabled=delete_disabled,
+                                help="Apaga do banco todos os lotes e o mestre deste SKU (se liberado).",
+                            ):
+                                st.session_state[f"prod_sku_del_confirm_{focus_id}"] = True
+
+                            if st.session_state.get(f"prod_sku_del_confirm_{focus_id}"):
+                                st.warning(
+                                    "Confirma a **exclusão permanente** de **todos os lotes** e do **mestre** "
+                                    "deste SKU no banco de dados? Não há como desfazer pelo aplicativo."
+                                )
+                                d1, d2 = st.columns(2)
+                                with d1:
+                                    if st.button(
+                                        "Sim, excluir SKU",
+                                        key=f"prod_sku_del_yes_{focus_id}",
+                                        type="primary",
+                                    ):
+                                        require_admin()
+                                        try:
+                                            hard_delete_sku_catalog(sku_key)
+                                        except ValueError as exc:
+                                            st.error(str(exc))
+                                        else:
+                                            st.session_state[
+                                                "_reset_sku_search_product_focus"
+                                            ] = True
+                                            st.session_state["_sku_deleted_ok_msg"] = (
+                                                "SKU, lotes e mestre foram excluídos do sistema."
+                                            )
+                                            st.session_state.pop(
+                                                f"prod_sku_del_confirm_{focus_id}", None
+                                            )
+                                            st.rerun()
+                                with d2:
+                                    if st.button(
+                                        "Cancelar",
+                                        key=f"prod_sku_del_no_{focus_id}",
+                                    ):
+                                        st.session_state.pop(
+                                            f"prod_sku_del_confirm_{focus_id}", None
+                                        )
+                                        st.rerun()
+                    else:
+                        st.warning(
+                            "Produto não encontrado ou excluído. Atualize a busca e selecione de novo."
+                        )
+
         st.markdown("### Cadastro de produto")
         st.caption(
-            "Cadastre apenas **novos lotes** (identidade + atributos). Exclusão de estoque é feita em **Estoque**. "
+            "Cadastre apenas **novos lotes** (identidade + atributos; **foto opcional**). Exclusão de estoque é feita em **Estoque**. "
             "Não é possível cadastrar de novo o mesmo **nome + data + atributos** nem um lote com o **mesmo SKU** "
             "(corpo idêntico, ignorando o número sequencial do início). "
             "O **SKU** é gerado como `[SEQ]-[PP]-[FC]-[LC]-[GG]-[PA]-[ST]`. "
@@ -2211,6 +1182,14 @@ def main():
             "Estilo", style_opts, key="prod_reg_style", current_value=""
         )
 
+        st.file_uploader(
+            "Foto do produto (opcional)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=False,
+            key="prod_reg_photo",
+            help="JPG, PNG ou WebP. Máximo 8 MB. Aparece no detalhe da busca por SKU e lote.",
+        )
+
         preview_sku = _maybe_preview_product_sku()
         if preview_sku:
             st.info(f"**SKU gerado (somente leitura):** `{preview_sku}`")
@@ -2219,7 +1198,13 @@ def main():
                 "Selecione todos os atributos para visualizar o SKU. Ele não pode ser editado manualmente."
             )
 
-        if st.button("Cadastrar produto", type="primary", key="prod_reg_submit"):
+        if st.button(
+            "Cadastrar produto",
+            type="primary",
+            key="prod_reg_submit",
+            disabled=not is_admin(),
+            help="Apenas administradores." if not is_admin() else None,
+        ):
             if not name.strip():
                 st.error("O nome do produto é obrigatório.")
             else:
@@ -2237,7 +1222,14 @@ def main():
                     for e in field_errors:
                         st.error(e)
                 else:
+                    require_admin()
                     try:
+                        _photo = st.session_state.get("prod_reg_photo")
+                        _img_bytes: Optional[bytes] = None
+                        _img_fn = ""
+                        if _photo is not None:
+                            _img_bytes = _photo.getvalue()
+                            _img_fn = getattr(_photo, "name", None) or "foto.jpg"
                         enter_code = add_product(
                             name=name,
                             stock=0,
@@ -2248,6 +1240,8 @@ def main():
                             palette=palette_val,
                             gender=gender_val,
                             unit_cost=0.0,
+                            product_image_bytes=_img_bytes,
+                            product_image_filename=_img_fn,
                         )
                     except ValueError as e:
                         if str(e) == DUPLICATE_SKU_BASE_ERROR_MSG:
@@ -2269,6 +1263,7 @@ def main():
                             "prod_reg_palette",
                             "prod_reg_gender",
                             "prod_reg_style",
+                            "prod_reg_photo",
                         ):
                             st.session_state.pop(k, None)
                         st.rerun()
@@ -2276,8 +1271,8 @@ def main():
     elif page == PAGE_VENDAS:
         st.markdown("### Vendas")
         st.caption(
-            "Fluxo: **1) SKU** → **2) Cliente** → **3) Quantidade** → **4) Desconto** → **Confirmar**. "
-            "Cada venda gera um **ID de venda** (#####V). O estoque sai do **lote** selecionado."
+            "Fluxo: **1) SKU** → **2) Cliente** → **3) Quantidade** → **4) Desconto** → **5) Forma de pagamento** "
+            "→ **Confirmar**. Cada venda gera um **ID de venda** (#####V). O estoque sai do **lote** selecionado."
         )
 
         sales_skus = fetch_skus_available_for_sale()
@@ -2333,11 +1328,7 @@ def main():
                 product_id = int(batch_row["id"])
 
             if product_id is not None:
-                with get_conn() as conn:
-                    pr = conn.execute(
-                        "SELECT stock, name, sku FROM products WHERE id = ?;",
-                        (product_id,),
-                    ).fetchone()
+                pr = fetch_product_stock_name_sku(int(product_id))
                 if pr is None:
                     st.error("O lote selecionado não existe mais.")
                     product_id = None
@@ -2474,6 +1465,16 @@ def main():
 
         st.divider()
 
+        # --- Etapa 5 — forma de pagamento ---
+        st.markdown("#### Etapa 5 — Forma de pagamento")
+        payment_method = st.selectbox(
+            "Forma de pagamento",
+            options=list(SALE_PAYMENT_OPTIONS),
+            key="sales_payment_method",
+        )
+
+        st.divider()
+
         # --- SUMMARY & CONFIRM ---
         st.markdown("#### Conferência e confirmação")
         ready = (
@@ -2498,6 +1499,7 @@ def main():
                     "Subtotal": format_money(base_price),
                     "Desconto": format_money(discount_amount),
                     "Total": format_money(final_price),
+                    "Forma de pagamento": payment_method,
                 }
                 st.table(
                     [{"Campo": k, "Valor": v} for k, v in sum_tbl.items()]
@@ -2513,12 +1515,14 @@ def main():
                 key="sales_confirm_btn",
                 disabled=not confirm,
             ):
+                require_operator_or_admin()
                 try:
                     code, total = record_sale(
                         product_id=int(product_id),
                         quantity=int(quantity),
                         customer_id=int(cust_id),
                         discount_amount=float(discount_amount),
+                        payment_method=str(payment_method),
                     )
                     st.success(
                         f"Venda **{code}** registrada. Total: **{format_money(total)}**"
@@ -2532,30 +1536,7 @@ def main():
 
         st.divider()
         st.markdown("#### Vendas recentes")
-        with get_conn() as conn:
-            recent = conn.execute(
-                """
-                SELECT
-                    s.sale_code,
-                    s.id,
-                    p.name AS product_name,
-                    s.sku,
-                    CASE
-                        WHEN s.customer_id IS NULL THEN '—'
-                        ELSE (COALESCE(c.customer_code, '') || ' — ' || COALESCE(c.name, ''))
-                    END AS customer_label,
-                    s.quantity,
-                    s.unit_price,
-                    s.discount_amount,
-                    s.total,
-                    s.sold_at
-                FROM sales s
-                JOIN products p ON p.id = s.product_id
-                LEFT JOIN customers c ON c.id = s.customer_id
-                ORDER BY s.id DESC
-                LIMIT 20;
-                """
-            ).fetchall()
+        recent = fetch_recent_sales_for_ui(limit=20)
 
         if not recent:
             st.info("Ainda não há vendas.")
@@ -2570,6 +1551,7 @@ def main():
                     "Unit.": format_money(float(r["unit_price"] or 0)),
                     "Desconto": format_money(float(r["discount_amount"] or 0)),
                     "Total": format_money(float(r["total"] or 0)),
+                    "Pagamento": (r["payment_method"] or "").strip() or "—",
                     "Data/Hora": r["sold_at"],
                 }
                 for r in recent
@@ -2577,60 +1559,10 @@ def main():
             st.dataframe(data, width="stretch", hide_index=True)
 
     elif page == PAGE_PAINEL:
-        st.markdown("### Painel")
-        stats = compute_dashboard()
-        revenue, cost, profit_loss = compute_sales_financials()
+        render_painel_executivo()
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Receita", format_money(stats["revenue"]))
-        col2.metric("Vendas", stats["sales_count"])
-        col3.metric("Unidades em estoque", stats["total_stock_units"])
-        col4.metric("Estoque baixo (≤5)", stats["low_stock"])
-
-        st.divider()
-        st.markdown("### Resultado (DRE simplificada — vendas realizadas)")
-        menu_col1, menu_col2, menu_col3 = st.columns(3)
-        menu_col1.metric("Receita", format_money(revenue))
-        menu_col2.metric("Custo", format_money(cost))
-        menu_col3.metric("Lucro / prejuízo", format_money(profit_loss))
-
-        col_left, col_right = st.columns([1, 1])
-
-        with col_left:
-            st.markdown("#### Receita ao longo do tempo")
-            df = fetch_revenue_timeseries()
-            if df.empty:
-                st.info("Sem vendas ainda. Registre a primeira venda para ver a receita.")
-            else:
-                st.line_chart(df.set_index("day")["revenue"])
-
-        with col_right:
-            st.markdown("#### Produtos com estoque baixo")
-            with get_conn() as conn:
-                low = conn.execute(
-                    """
-                    SELECT p.id, p.name, COALESCE(sm.selling_price, p.price, 0) AS price, p.stock
-                    FROM products p
-                    LEFT JOIN sku_master sm ON sm.sku = p.sku
-                    WHERE p.stock <= 5
-                    ORDER BY p.stock ASC, p.id DESC
-                    LIMIT 25;
-                    """
-                ).fetchall()
-
-            if not low:
-                st.success("Nenhum produto com estoque baixo.")
-            else:
-                data = [
-                    {
-                        "ID": r["id"],
-                        "Nome": r["name"],
-                        "Preço venda": format_money(r["price"]),
-                        "Estoque": r["stock"],
-                    }
-                    for r in low
-                ]
-                st.dataframe(data, width="stretch", hide_index=True)
+    elif page == PAGE_UAT:
+        _render_uat_manual_checklist_page()
 
     elif page == PAGE_CUSTOS:
         st.markdown("### Custos")
@@ -2644,6 +1576,10 @@ def main():
         sku_rows = fetch_sku_master_rows()
         sku_list = [r["sku"] for r in sku_rows] if sku_rows else []
 
+        costing_struct_name_label_by_sku = (
+            fetch_product_triple_label_by_sku() if sku_list else {}
+        )
+
         st.markdown("#### Composição de custo do SKU (componentes planejados)")
         if not sku_list:
             st.info(
@@ -2651,11 +1587,43 @@ def main():
                 "(ou confira o `sku_master`) para usar a composição de custo."
             )
         else:
-            sel_sku = st.selectbox(
-                "SKU para composição de custo",
-                options=sku_list,
-                key="costing_struct_sku_select",
+            st.radio(
+                "Localizar produto",
+                (COSTING_STRUCT_PICK_SKU, COSTING_STRUCT_PICK_NAME),
+                horizontal=True,
+                key="costing_struct_pick_mode",
             )
+            pick_mode = st.session_state.get(
+                "costing_struct_pick_mode", COSTING_STRUCT_PICK_SKU
+            )
+            if pick_mode == COSTING_STRUCT_PICK_SKU:
+                sel_sku = st.selectbox(
+                    "SKU para composição de custo",
+                    options=sku_list,
+                    key="costing_struct_sku_select",
+                )
+            else:
+                base_labels: list[tuple[str, str]] = []
+                for sku_val in sku_list:
+                    s = str(sku_val).strip()
+                    bl = costing_struct_name_label_by_sku.get(s, "— — —")
+                    base_labels.append((bl, s))
+                dup_count: dict[str, int] = {}
+                for bl, _s in base_labels:
+                    dup_count[bl] = dup_count.get(bl, 0) + 1
+                name_pairs: list[tuple[str, str]] = []
+                for bl, s in base_labels:
+                    disp = f"{bl} — [{s}]" if dup_count.get(bl, 0) > 1 else bl
+                    name_pairs.append((disp, s))
+                name_pairs.sort(key=lambda t: (t[0].lower(), t[1]))
+                name_labels = [p[0] for p in name_pairs]
+                chosen_label = st.selectbox(
+                    "Nome — cor da armação — cor da lente",
+                    options=name_labels,
+                    key="costing_struct_name_select",
+                )
+                sel_sku = name_pairs[name_labels.index(chosen_label)][1]
+
             marker = "costing_struct_session_sku"
             if st.session_state.get(marker) != sel_sku:
                 st.session_state[marker] = sel_sku
@@ -2726,7 +1694,13 @@ def main():
                     f"Último total salvo: **{format_money(float(saved_row['structured_cost_total'] or 0))}**"
                 )
 
-            if st.button("Salvar composição de custo", type="primary", key="costing_struct_save"):
+            if st.button(
+                "Salvar composição de custo",
+                type="primary",
+                key="costing_struct_save",
+                disabled=not is_admin(),
+                help="Apenas administradores." if not is_admin() else None,
+            ):
                 payload = []
                 save_errs = []
                 for key, label in SKU_COST_COMPONENT_DEFINITIONS:
@@ -2743,6 +1717,7 @@ def main():
                     for e in save_errs:
                         st.error(e)
                 else:
+                    require_admin()
                     try:
                         save_sku_cost_structure(sel_sku, payload)
                         st.success("Composição de custo salva.")
@@ -2769,7 +1744,8 @@ def main():
 
         st.markdown("#### Entrada de estoque (fluxo por SKU)")
         st.caption(
-            "**Etapa 1** — Escolha o SKU (carrega componentes salvos). **Etapa 2** — Lote que recebe a mercadoria. "
+            "**Etapa 1** — Localize o produto **por SKU** ou **por nome** (igual à composição de custo); carrega componentes salvos. "
+            "**Etapa 2** — Lote que recebe a mercadoria. "
             "**Etapa 3** — Quantidade a adicionar (> 0, até 4 decimais). **Etapa 4** — Custo unitário = **total** "
             "da composição salva acima. **Etapa 5** — Confirme o resumo e finalize — o **CMP** atualiza pela média ponderada."
         )
@@ -2777,11 +1753,46 @@ def main():
         if not sku_list:
             st.info("Nenhum SKU disponível para entrada de estoque.")
         else:
-            stock_entry_sku = st.selectbox(
-                "Etapa 1 — Selecionar SKU",
-                options=sku_list,
-                key="costing_stock_entry_sku",
+            st.markdown("##### Etapa 1 — Localizar produto")
+            st.radio(
+                "Localizar produto",
+                (COSTING_STRUCT_PICK_SKU, COSTING_STRUCT_PICK_NAME),
+                horizontal=True,
+                key="costing_stock_entry_pick_mode",
             )
+            pick_mode_se = st.session_state.get(
+                "costing_stock_entry_pick_mode", COSTING_STRUCT_PICK_SKU
+            )
+            if pick_mode_se == COSTING_STRUCT_PICK_SKU:
+                stock_entry_sku = st.selectbox(
+                    "SKU",
+                    options=sku_list,
+                    key="costing_stock_entry_sku",
+                )
+            else:
+                base_labels_se: list[tuple[str, str]] = []
+                for sku_val in sku_list:
+                    s = str(sku_val).strip()
+                    bl = costing_struct_name_label_by_sku.get(s, "— — —")
+                    base_labels_se.append((bl, s))
+                dup_count_se: dict[str, int] = {}
+                for bl, _s in base_labels_se:
+                    dup_count_se[bl] = dup_count_se.get(bl, 0) + 1
+                name_pairs_se: list[tuple[str, str]] = []
+                for bl, s in base_labels_se:
+                    disp = f"{bl} — [{s}]" if dup_count_se.get(bl, 0) > 1 else bl
+                    name_pairs_se.append((disp, s))
+                name_pairs_se.sort(key=lambda t: (t[0].lower(), t[1]))
+                name_labels_se = [p[0] for p in name_pairs_se]
+                chosen_label_se = st.selectbox(
+                    "Nome — cor da armação — cor da lente",
+                    options=name_labels_se,
+                    key="costing_stock_entry_name_select",
+                )
+                stock_entry_sku = name_pairs_se[name_labels_se.index(chosen_label_se)][
+                    1
+                ]
+
             marker_stock = "costing_stock_entry_sku_marker"
             if st.session_state.get(marker_stock) != stock_entry_sku:
                 st.session_state[marker_stock] = stock_entry_sku
@@ -2893,8 +1904,10 @@ def main():
                     "Finalizar entrada de estoque",
                     type="primary",
                     key="costing_stock_finalize",
-                    disabled=not can_finalize,
+                    disabled=(not can_finalize) or (not is_admin()),
+                    help="Apenas administradores." if not is_admin() else None,
                 ):
+                    require_admin()
                     try:
                         add_stock_receipt(stock_entry_sku.strip(), pid, float(qv), float(unit_cost))
                         st.success(
@@ -2933,12 +1946,13 @@ def main():
             st.dataframe(eh, width="stretch", hide_index=True)
 
     elif page == PAGE_PRECIFICACAO:
+        require_admin()
         st.markdown("### Precificação (por SKU)")
 
         st.caption(
-            "**Etapa 1** — Escolha o SKU; **custo base** = **custo médio ponderado (CMP)** atual. "
-            "**Etapa 2** — Informe margem, impostos e encargos em % (≥ 0). **Etapa 3** — Revise os preços "
-            "calculados. **Etapa 4** — Salvar cria um **novo** registro (não apaga históricos). "
+            "**Etapa 1** — Localize o produto **por SKU** ou **por nome** (mesmo padrão de **Custos**); **custo base** = **CMP** atual. "
+            "**Etapa 2** — Margem, impostos e encargos: **percentual (%)** ou **valor fixo em R$** (≥ 0). "
+            "**Etapa 3** — Revise os preços calculados. **Etapa 4** — Salvar cria um **novo** registro. "
             "O registro **ativo** é o último salvo; **Vendas** usa o **preço alvo** dele."
         )
 
@@ -2948,7 +1962,43 @@ def main():
             return
 
         sku_list = [r["sku"] for r in sku_rows]
-        sel_sku = st.selectbox("Etapa 1 — Selecionar SKU", options=sku_list, key="pricing_sku_select")
+        name_label_by_sku = fetch_product_triple_label_by_sku()
+
+        st.markdown("#### Etapa 1 — Localizar produto")
+        st.radio(
+            "Localizar produto",
+            (COSTING_STRUCT_PICK_SKU, COSTING_STRUCT_PICK_NAME),
+            horizontal=True,
+            key="pricing_pick_mode",
+        )
+        pick_mode = st.session_state.get("pricing_pick_mode", COSTING_STRUCT_PICK_SKU)
+        if pick_mode == COSTING_STRUCT_PICK_SKU:
+            sel_sku = st.selectbox(
+                "SKU",
+                options=sku_list,
+                key="pricing_sku_select",
+            )
+        else:
+            base_labels: list[tuple[str, str]] = []
+            for sku_val in sku_list:
+                s = str(sku_val).strip()
+                bl = name_label_by_sku.get(s, "— — —")
+                base_labels.append((bl, s))
+            dup_count: dict[str, int] = {}
+            for bl, _s in base_labels:
+                dup_count[bl] = dup_count.get(bl, 0) + 1
+            name_pairs: list[tuple[str, str]] = []
+            for bl, s in base_labels:
+                disp = f"{bl} — [{s}]" if dup_count.get(bl, 0) > 1 else bl
+                name_pairs.append((disp, s))
+            name_pairs.sort(key=lambda t: (t[0].lower(), t[1]))
+            name_labels = [p[0] for p in name_pairs]
+            chosen_label = st.selectbox(
+                "Nome — cor da armação — cor da lente",
+                options=name_labels,
+                key="pricing_name_select",
+            )
+            sel_sku = name_pairs[name_labels.index(chosen_label)][1]
 
         sm = next((r for r in sku_rows if r["sku"] == sel_sku), None)
         if sm is None:
@@ -2963,10 +2013,28 @@ def main():
                 st.session_state["pricing_wf_markup"] = float(active_row["markup_pct"])
                 st.session_state["pricing_wf_taxes"] = float(active_row["taxes_pct"])
                 st.session_state["pricing_wf_interest"] = float(active_row["interest_pct"])
+                st.session_state["pricing_wf_markup_mode"] = (
+                    PRICING_MODE_ABS
+                    if int(active_row["markup_kind"] or 0) == 1
+                    else PRICING_MODE_PCT
+                )
+                st.session_state["pricing_wf_taxes_mode"] = (
+                    PRICING_MODE_ABS
+                    if int(active_row["taxes_kind"] or 0) == 1
+                    else PRICING_MODE_PCT
+                )
+                st.session_state["pricing_wf_interest_mode"] = (
+                    PRICING_MODE_ABS
+                    if int(active_row["interest_kind"] or 0) == 1
+                    else PRICING_MODE_PCT
+                )
             else:
                 st.session_state["pricing_wf_markup"] = 0.0
                 st.session_state["pricing_wf_taxes"] = 0.0
                 st.session_state["pricing_wf_interest"] = 0.0
+                st.session_state["pricing_wf_markup_mode"] = PRICING_MODE_PCT
+                st.session_state["pricing_wf_taxes_mode"] = PRICING_MODE_PCT
+                st.session_state["pricing_wf_interest_mode"] = PRICING_MODE_PCT
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -2986,43 +2054,90 @@ def main():
                 "Custo médio do estoque **indisponível** (CMP zero). Dê entrada em **Custos** antes de precificar."
             )
 
-        st.markdown("#### Etapa 2 — Parâmetros de preço (%)")
-        st.caption("Todos os valores são percentuais, com duas casas decimais (ex.: 10,50%).")
+        st.markdown("#### Etapa 2 — Parâmetros de preço")
+        st.caption(
+            "Em **%**, o valor incide sobre a base indicada em cada linha. Em **R$**, soma-se um valor fixo "
+            "(margem sobre o CMP; impostos sobre o preço pré-impostos; encargos sobre o preço com impostos)."
+        )
         pc1, pc2, pc3 = st.columns(3)
         with pc1:
+            st.radio(
+                "Margem — modo",
+                (PRICING_MODE_PCT, PRICING_MODE_ABS),
+                horizontal=True,
+                key="pricing_wf_markup_mode",
+            )
+            m_is_abs = (
+                st.session_state.get("pricing_wf_markup_mode", PRICING_MODE_PCT) == PRICING_MODE_ABS
+            )
             markup_pct = st.number_input(
-                "Margem (%)",
+                "Margem em R$" if m_is_abs else "Margem em %",
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
                 key="pricing_wf_markup",
             )
         with pc2:
+            st.radio(
+                "Impostos — modo",
+                (PRICING_MODE_PCT, PRICING_MODE_ABS),
+                horizontal=True,
+                key="pricing_wf_taxes_mode",
+            )
+            t_is_abs = (
+                st.session_state.get("pricing_wf_taxes_mode", PRICING_MODE_PCT) == PRICING_MODE_ABS
+            )
             taxes_pct = st.number_input(
-                "Impostos (%)",
+                "Impostos em R$" if t_is_abs else "Impostos em %",
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
                 key="pricing_wf_taxes",
             )
         with pc3:
+            st.radio(
+                "Encargos / juros — modo",
+                (PRICING_MODE_PCT, PRICING_MODE_ABS),
+                horizontal=True,
+                key="pricing_wf_interest_mode",
+            )
+            i_is_abs = (
+                st.session_state.get("pricing_wf_interest_mode", PRICING_MODE_PCT)
+                == PRICING_MODE_ABS
+            )
             interest_pct = st.number_input(
-                "Encargos / juros (%)",
+                "Encargos / juros em R$" if i_is_abs else "Encargos / juros em %",
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
                 key="pricing_wf_interest",
             )
 
+        m_abs = (
+            st.session_state.get("pricing_wf_markup_mode", PRICING_MODE_PCT) == PRICING_MODE_ABS
+        )
+        t_abs = (
+            st.session_state.get("pricing_wf_taxes_mode", PRICING_MODE_PCT) == PRICING_MODE_ABS
+        )
+        i_abs = (
+            st.session_state.get("pricing_wf_interest_mode", PRICING_MODE_PCT) == PRICING_MODE_ABS
+        )
+
         st.markdown("#### Etapa 3 — Preços calculados")
         if avg_cost > 0:
             pb, pwt, tgt = compute_sku_pricing_targets(
-                avg_cost, float(markup_pct), float(taxes_pct), float(interest_pct)
+                avg_cost,
+                float(markup_pct),
+                float(taxes_pct),
+                float(interest_pct),
+                markup_absolute=m_abs,
+                taxes_absolute=t_abs,
+                interest_absolute=i_abs,
             )
             st.caption(
-                "1) Preço antes de impostos = CMP + (CMP × Margem%). "
-                "2) Preço com impostos = (1) + ((1) × Impostos%). "
-                "3) Preço alvo = (2) + ((2) × Encargos%)."
+                "1) **Pré-impostos** = CMP + margem (% sobre CMP **ou** +R$). "
+                "2) **Com impostos** = (1) + impostos (% sobre (1) **ou** +R$). "
+                "3) **Alvo** = (2) + encargos (% sobre (2) **ou** +R$)."
             )
             m1, m2, m3 = st.columns(3)
             with m1:
@@ -3045,12 +2160,16 @@ def main():
             key=f"pricing_wf_save_{sel_sku}",
             disabled=not can_save,
         ):
+            require_admin()
             try:
                 save_sku_pricing_workflow(
                     sel_sku,
                     float(markup_pct),
                     float(taxes_pct),
                     float(interest_pct),
+                    markup_kind=1 if m_abs else 0,
+                    taxes_kind=1 if t_abs else 0,
+                    interest_kind=1 if i_abs else 0,
                 )
                 st.success(
                     "Precificação salva. Novo registro criado; histórico preservado. Preço alvo ativo para Vendas."
@@ -3069,9 +2188,21 @@ def main():
                     "ID": r["id"],
                     "Ativo": "Sim" if int(r["is_active"] or 0) else "—",
                     "CMP (instantâneo)": format_money(float(r["avg_cost_snapshot"])),
-                    "Margem %": f"{float(r['markup_pct']):.2f}%",
-                    "Impostos %": f"{float(r['taxes_pct']):.2f}%",
-                    "Encargos %": f"{float(r['interest_pct']):.2f}%",
+                    "Margem": (
+                        format_money(float(r["markup_pct"]))
+                        if int(r["markup_kind"] or 0) == 1
+                        else f"{float(r['markup_pct']):.2f}%"
+                    ),
+                    "Impostos": (
+                        format_money(float(r["taxes_pct"]))
+                        if int(r["taxes_kind"] or 0) == 1
+                        else f"{float(r['taxes_pct']):.2f}%"
+                    ),
+                    "Encargos": (
+                        format_money(float(r["interest_pct"]))
+                        if int(r["interest_kind"] or 0) == 1
+                        else f"{float(r['interest_pct']):.2f}%"
+                    ),
                     "Preço pré-impostos": format_money(float(r["price_before_taxes"])),
                     "Preço c/ impostos": format_money(float(r["price_with_taxes"])),
                     "Preço alvo": format_money(float(r["target_price"])),
@@ -3104,7 +2235,7 @@ def main():
         st.caption(
             "Cadastre clientes com busca opcional de endereço via **ViaCEP**. "
             "**Salvar cliente** grava na tabela local **`customers`** do SQLite "
-            f"(`{DB_PATH.name}` na pasta do aplicativo). "
+            f"(`{get_sqlite_db_path()}`). "
             "O **código do cliente** é gerado pelo banco — não preencha no formulário."
         )
 
@@ -3239,6 +2370,7 @@ def main():
                             country = (
                                 st.session_state.get("cust_reg_country") or ""
                             ).strip() or None
+                            require_operator_or_admin()
                             try:
                                 new_code = insert_customer_row(
                                     name=name,
@@ -3302,6 +2434,9 @@ def main():
 
         with tab_edit:
             st.markdown("#### Editar cliente")
+            _cust_del_msg = st.session_state.pop("_cust_deleted_ok", None)
+            if _cust_del_msg:
+                st.success(_cust_del_msg)
             rows_edit = fetch_customers_ordered()
             if not rows_edit:
                 st.info("Nenhum cliente — cadastre na aba **Cadastrar**.")
@@ -3415,6 +2550,7 @@ def main():
                                 phone_norm = normalize_phone_digits(
                                     st.session_state.get(f"cust_edit_phone_{cid}", "")
                                 )
+                                require_operator_or_admin()
                                 try:
                                     update_customer_row(
                                         customer_id=cid,
@@ -3487,7 +2623,59 @@ def main():
                                     st.session_state.pop("cust_edit_pick_id", None)
                                     st.rerun()
 
+                st.divider()
+                st.markdown("##### Excluir cadastro")
+                st.caption(
+                    "Remove o cliente **definitivamente** do banco. "
+                    "Não é permitido se já existir **venda** vinculada a ele."
+                )
+                if st.button(
+                    "Excluir cliente permanentemente",
+                    type="secondary",
+                    key=f"cust_del_open_{cid}",
+                ):
+                    st.session_state[f"cust_del_confirm_{cid}"] = True
+                if st.session_state.get(f"cust_del_confirm_{cid}"):
+                    st.warning(
+                        f"Confirma a exclusão **permanente** do cliente **{cc} — {row['name']}**? "
+                        "Esta ação não pode ser desfeita."
+                    )
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        if st.button(
+                            "Sim, excluir definitivamente",
+                            type="primary",
+                            key=f"cust_del_yes_{cid}",
+                        ):
+                            require_admin()
+                            try:
+                                delete_customer_row(cid)
+                            except ValueError as e:
+                                st.error(str(e))
+                                st.session_state.pop(f"cust_del_confirm_{cid}", None)
+                            else:
+                                for k in list(st.session_state.keys()):
+                                    if k.endswith(f"_{cid}") and k.startswith(
+                                        "cust_edit_"
+                                    ):
+                                        st.session_state.pop(k, None)
+                                st.session_state.pop(f"cust_del_confirm_{cid}", None)
+                                st.session_state.pop("cust_edit_pick_id", None)
+                                st.session_state.pop("cust_edit_sel", None)
+                                st.session_state["_cust_deleted_ok"] = (
+                                    f"Cliente **{cc}** excluído do sistema."
+                                )
+                                st.rerun()
+                    with dc2:
+                        if st.button(
+                            "Cancelar",
+                            key=f"cust_del_no_{cid}",
+                        ):
+                            st.session_state.pop(f"cust_del_confirm_{cid}", None)
+                            st.rerun()
+
     elif page == PAGE_ESTOQUE:
+        require_admin()
         st.markdown(
             """
             <style>
@@ -3674,6 +2862,7 @@ def main():
                     type="primary",
                     key="confirm_exclude_stock_btn",
                 ):
+                    require_admin()
                     reset_batch_pricing_and_exclude(code)
                     st.session_state.pending_exclude_code = None
                     st.session_state.pending_exclude_label = None
@@ -3703,6 +2892,7 @@ def main():
             cost = round(float(r["cost"] or 0), 2)
             price = round(float(r["price"] or 0), 2)
             stock_qty = int(r["stock"] or 0)
+            stock_val = float(r["stock"] or 0)
             markup_amount = round(price - cost, 2)
 
             items.append(
@@ -3721,8 +2911,117 @@ def main():
                     "price": price,
                     "markup": markup_amount,
                     "stock_qty": stock_qty,
+                    "stock_val": stock_val,
                 }
             )
+
+        if "stock_baixa_form_nonce" not in st.session_state:
+            st.session_state.stock_baixa_form_nonce = 0
+        _baixa_confirm_key = (
+            f"stock_baixa_confirm_checkbox_{st.session_state.stock_baixa_form_nonce}"
+        )
+        with st.expander("Baixa manual de estoque", expanded=False):
+            st.caption(
+                "Reduz apenas a quantidade em stock do **lote** selecionado. "
+                "Não altera custo, preço de venda nem regista venda no histórico; o total "
+                "por SKU no mestre é actualizado para refletir a soma dos lotes."
+            )
+
+            def _stock_baixa_nome_produto_antes_sku(it: dict) -> str:
+                """Nome do produto + cores (por lote), no mesmo espírito do rótulo triplo da app."""
+                nome = (it.get("name") or "").strip() or "—"
+                fc = (it.get("frame_color") or "").strip()
+                lc = (it.get("lens_color") or "").strip()
+                partes: list[str] = [nome]
+                if fc:
+                    partes.append(fc)
+                if lc:
+                    partes.append(lc)
+                return " — ".join(partes)
+
+            _baixa_opts = sorted(
+                items,
+                key=lambda x: (
+                    (x.get("name") or "").lower(),
+                    x.get("sku") or "",
+                    x["product_id"],
+                ),
+            )
+            _baixa_labels = [
+                (
+                    f"#{it['product_id']} — {_stock_baixa_nome_produto_antes_sku(it)} — "
+                    f"SKU {it['sku'] or '—'} — Lote {it['code'] or '—'} — em stock: "
+                    f"{format_qty_display_4(float(it['stock_qty']))}"
+                )
+                for it in _baixa_opts
+            ]
+            _baixa_label_to_pid = dict(
+                zip(_baixa_labels, [it["product_id"] for it in _baixa_opts])
+            )
+            _sel_baixa = st.selectbox(
+                "Produto (lote com stock)",
+                options=_baixa_labels,
+                key="stock_manual_baixa_select",
+            )
+            _pid_baixa = _baixa_label_to_pid[_sel_baixa]
+            _max_baixa = float(
+                next(
+                    (r["stock"] or 0)
+                    for r in in_stock_products
+                    if int(r["id"]) == int(_pid_baixa)
+                )
+            )
+            _default_baixa = min(1.0, _max_baixa) if _max_baixa > 0 else 0.0
+            _qty_baixa = st.number_input(
+                "Quantidade a dar baixa",
+                min_value=0.0,
+                max_value=_max_baixa,
+                value=float(_default_baixa),
+                step=0.0001,
+                format="%.4f",
+                key="stock_manual_baixa_qty",
+            )
+            st.warning(
+                "Esta operação é irreversível pelo próprio formulário "
+                "(excepto nova entrada de stock em **Custos**). "
+                "Confirme o lote e a quantidade antes de continuar."
+            )
+            st.checkbox(
+                "Confirmo a baixa de estoque neste lote e quantidade.",
+                key=_baixa_confirm_key,
+            )
+            if st.button(
+                "Aplicar baixa de estoque",
+                type="primary",
+                key="stock_manual_baixa_aplicar",
+            ):
+                if not bool(st.session_state.get(_baixa_confirm_key)):
+                    st.error("Marque a confirmação antes de aplicar a baixa.")
+                elif _qty_baixa <= 0:
+                    st.error("Indique uma quantidade maior que zero.")
+                elif _qty_baixa > _max_baixa + 1e-9:
+                    st.error("Quantidade superior ao stock disponível neste lote.")
+                else:
+                    try:
+                        _novo = apply_manual_stock_write_down(
+                            _pid_baixa,
+                            float(_qty_baixa),
+                            user_id=get_audit_session_user_id(),
+                            tenant_id=effective_tenant_id_for_request(),
+                        )
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        st.success(
+                            "Baixa aplicada. Stock restante deste lote: "
+                            f"**{format_qty_display_4(float(_novo))}**."
+                        )
+                        st.session_state.stock_baixa_form_nonce = (
+                            int(st.session_state.stock_baixa_form_nonce) + 1
+                        )
+                        st.rerun()
+
+        st.divider()
 
         # Column layout: tight weights; Streamlit columns share full width proportionally.
         stock_col_w = [
@@ -3874,72 +3173,149 @@ def main():
                 continue
             filtered.append(it)
 
-        # Default order.
-        filtered.sort(
-            key=lambda x: ((x.get("name") or "").lower(), x.get("registered_date") or "")
-        )
-
-        # Totals (for filtered rows).
-        totals_cost = 0.0
-        totals_price = 0.0
-        totals_markup = 0.0
-        totals_stock = 0
-
         if not filtered:
             st.info("Nenhuma linha corresponde aos filtros atuais.")
             return
 
+        _estoque_sort_labels = {
+            "sku": "SKU (A–Z)",
+            "name": "Nome (A–Z)",
+            "stock_desc": "Estoque (maior → menor)",
+            "stock_asc": "Estoque (menor → maior)",
+        }
+        _sort_estoque = st.selectbox(
+            "Ordenar por",
+            ["sku", "name", "stock_desc", "stock_asc"],
+            index=1,
+            format_func=lambda k: _estoque_sort_labels[k],
+            key="estoque_inv_sort_by",
+        )
+        if _sort_estoque == "sku":
+            filtered.sort(
+                key=lambda x: (str(x.get("sku") or "").lower(), x.get("product_id", 0))
+            )
+        elif _sort_estoque == "name":
+            filtered.sort(
+                key=lambda x: (
+                    (x.get("name") or "").lower(),
+                    str(x.get("registered_date") or ""),
+                    x.get("product_id", 0),
+                )
+            )
+        elif _sort_estoque == "stock_desc":
+            filtered.sort(
+                key=lambda x: (-float(x["stock_qty"]), (x.get("name") or "").lower())
+            )
+        else:
+            filtered.sort(
+                key=lambda x: (float(x["stock_qty"]), (x.get("name") or "").lower())
+            )
+
+        totals_cost = 0.0
+        totals_price = 0.0
+        totals_markup = 0.0
+        totals_stock = 0
+        _stock_grid_records: list[dict] = []
         for it in filtered:
-            product_id = int(it["product_id"])
-            code = it["code"]
-            sku = it["sku"]
-            name = it["name"]
             cost = float(it["cost"])
             price = float(it["price"])
             markup_amount = float(it["markup"])
             stock_qty = int(it["stock_qty"])
-
-            row = st.columns(stock_col_w)
-            with row[0]:
-                if code and st.button(
-                    "Excluir",
-                    type="secondary",
-                    key=f"stock_exclude_{product_id}",
-                ):
-                    st.session_state.pending_exclude_code = code
-                    attr_bits = " · ".join(
-                        x
-                        for x in (
-                            it["frame_color"],
-                            it["lens_color"],
-                            it["style"],
-                            it["palette"],
-                            it["gender"],
-                        )
-                        if x
-                    )
-                    extra = f" | {attr_bits}" if attr_bits else ""
-                    st.session_state.pending_exclude_label = (
-                        f"{name}{extra} | SKU: {sku} | Cód.: {code}"
-                    )
-                    st.rerun()
-
-            row[1].markdown(f"**{name}**")
-            row[2].write(sku or "—")
-            row[3].write(it["frame_color"] or "—")
-            row[4].write(it["lens_color"] or "—")
-            row[5].write(it["style"] or "—")
-            row[6].write(it["palette"] or "—")
-            row[7].write(it["gender"] or "—")
-            row[8].write(format_money(cost))
-            row[9].write(format_money(price))
-            row[10].write(format_money(markup_amount))
-            row[11].write(stock_qty)
-
             totals_cost += cost * stock_qty
             totals_price += price * stock_qty
             totals_markup += markup_amount * stock_qty
             totals_stock += stock_qty
+            _stock_grid_records.append(
+                {
+                    "Nome do produto": it["name"] or "—",
+                    "SKU": it["sku"] or "—",
+                    "Cor armação": it["frame_color"] or "—",
+                    "Cor lente": it["lens_color"] or "—",
+                    "Estilo": it["style"] or "—",
+                    "Paleta": it["palette"] or "—",
+                    "Gênero": it["gender"] or "—",
+                    "Custo": cost,
+                    "Preço de venda": price,
+                    "Margem": markup_amount,
+                    "Em estoque": float(it["stock_val"]),
+                }
+            )
+
+        _stock_df = pd.DataFrame(_stock_grid_records)
+        _stock_column_order = [
+            "Nome do produto",
+            "SKU",
+            "Cor armação",
+            "Cor lente",
+            "Estilo",
+            "Paleta",
+            "Gênero",
+            "Custo",
+            "Preço de venda",
+            "Margem",
+            "Em estoque",
+        ]
+        _stock_grid_state = st.dataframe(
+            _stock_df,
+            width="stretch",
+            hide_index=True,
+            column_order=_stock_column_order,
+            column_config={
+                "Custo": st.column_config.NumberColumn(format="%.2f"),
+                "Preço de venda": st.column_config.NumberColumn(format="%.2f"),
+                "Margem": st.column_config.NumberColumn(format="%.2f"),
+                "Em estoque": st.column_config.NumberColumn(format="%.4f"),
+            },
+            on_select="rerun",
+            selection_mode="single-row",
+            key="estoque_inventory_data_grid",
+        )
+
+        st.caption(
+            "**Excluir lote:** seleccione **uma linha** na grelha (como em **Produtos · Busca por SKU**) "
+            "e clique em **Excluir lote selecionado**."
+        )
+        if st.button(
+            "Excluir lote selecionado",
+            type="secondary",
+            key="estoque_exclude_from_grid_selection",
+        ):
+            _sel_rows: list[int] = []
+            try:
+                _sel_rows = list(_stock_grid_state.selection.rows)
+            except (AttributeError, TypeError):
+                _sel_rows = []
+            if not _sel_rows:
+                st.error("Seleccione uma linha na grelha antes de excluir.")
+            else:
+                _ridx = int(_sel_rows[0])
+                if _ridx < 0 or _ridx >= len(filtered):
+                    st.error("Linha seleccionada inválida. Tente novamente.")
+                else:
+                    _it = filtered[_ridx]
+                    _code = (_it.get("code") or "").strip()
+                    if not _code:
+                        st.error("Este registo não tem código de entrada para exclusão.")
+                    else:
+                        _name = _it.get("name") or ""
+                        _sku = _it.get("sku") or ""
+                        attr_bits = " · ".join(
+                            x
+                            for x in (
+                                _it.get("frame_color"),
+                                _it.get("lens_color"),
+                                _it.get("style"),
+                                _it.get("palette"),
+                                _it.get("gender"),
+                            )
+                            if x
+                        )
+                        extra = f" | {attr_bits}" if attr_bits else ""
+                        st.session_state.pending_exclude_code = _code
+                        st.session_state.pending_exclude_label = (
+                            f"{_name}{extra} | SKU: {_sku} | Cód.: {_code}"
+                        )
+                        st.rerun()
 
         st.divider()
         total_row = st.columns(stock_col_w)
