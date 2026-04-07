@@ -105,11 +105,13 @@ try:
         st.info("Não há vendas no período selecionado.")
     else:
         df = pd.DataFrame([{"day": r["day"], "revenue": float(r["revenue"] or 0)} for r in rows])
+        # Evita eixo temporal com horas (12:00, 18:00): usar rótulos de dia em texto.
+        df["dia"] = pd.to_datetime(df["day"], errors="coerce").dt.strftime("%d/%m/%Y")
         fig = px.bar(
             df,
-            x="day",
+            x="dia",
             y="revenue",
-            labels={"day": "Dia", "revenue": "Receita (R$)"},
+            labels={"dia": "Dia", "revenue": "Receita (R$)"},
             text_auto=".2f",
         )
         fig.update_traces(marker_color="#1f77b4")
@@ -119,6 +121,7 @@ try:
             hovermode="x unified",
             margin=dict(l=20, r=20, t=40, b=20),
         )
+        fig.update_xaxes(type="category", title="Dia")
         st.plotly_chart(fig, use_container_width=True)
 
 except Exception as e:

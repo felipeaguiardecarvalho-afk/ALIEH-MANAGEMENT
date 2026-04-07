@@ -19,3 +19,4 @@ __pycache__/
 # Pastas de dados da app (raiz do repositório)
 audit_backups/
 product_images/
+.alieh_data/

@@ -20,9 +20,9 @@
 Na primeira ligação por processo é registado ``Active database backend=sqlite`` ou
 ``backend=postgresql`` com alvo mascarado (DSN sem password).
 
-**SQLite em produção:** ficheiro em ``DB_PATH`` (defeito ``/data/business.db``). A pasta
-``/data`` é criada se não existir; o ficheiro só é criado ao abrir a primeira ligação —
-**nunca** apagado por esta camada (:func:`database.init_db` usa ``IF NOT EXISTS``).
+**SQLite:** ficheiro em ``DB_PATH``. Ordem de pastas: ``/data`` (Docker) se gravável;
+senão ``.alieh_data`` na raiz do repositório (ex.: Streamlit Cloud); senão ``/tmp/...``.
+O ficheiro só é criado ao abrir a primeira ligação (:func:`database.init_db` usa ``IF NOT EXISTS``).
 
 Ligações SQLite usam :class:`database.timed_sqlite.TimedSqliteConnection` para registo de
 duração das queries (DEBUG por defeito; INFO se exceder ``SLOW_QUERY_MS``).
@@ -35,6 +35,7 @@ import os
 import re
 import socket
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Union
@@ -67,22 +68,39 @@ _last_periodic_health_monotonic: float = 0.0
 _primary_database_postgres_logged = False
 _fallback_to_sqlite_logged = False
 
-# Caminho fixo fora do repositório: deploys / rebuilts não substituem o volume de dados.
-SQLITE_DATA_DIR = Path("/data")
 SQLITE_DB_FILENAME = "business.db"
+
+
+def _resolve_sqlite_data_dir() -> Path:
+    """
+    ``/data`` em VPS/Docker com volume; em Streamlit Cloud (sem escrita em ``/data``)
+    usa pasta no clone do repo ou ``tempfile``.
+    """
+    primary = Path("/data")
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except (PermissionError, OSError):
+        pass
+    repo_root = Path(__file__).resolve().parents[1]
+    local = repo_root / ".alieh_data"
+    try:
+        local.mkdir(parents=True, exist_ok=True)
+        return local
+    except (PermissionError, OSError):
+        pass
+    fallback = Path(tempfile.gettempdir()) / "alieh_sqlite_data"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+SQLITE_DATA_DIR = _resolve_sqlite_data_dir()
 DB_PATH: Path = SQLITE_DATA_DIR / SQLITE_DB_FILENAME
-
-
-def _ensure_sqlite_data_dir() -> None:
-    SQLITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-_ensure_sqlite_data_dir()
 try:
     _db_path_logged = str(DB_PATH.resolve())
 except OSError:
     _db_path_logged = str(DB_PATH)
-_logger.info("SQLite database path: %s", _db_path_logged)
+_logger.info("SQLite database path: %s (dir=%s)", _db_path_logged, SQLITE_DATA_DIR)
 
 # Tipo de retorno unificado (SQLite Row vs Postgres dict_row).
 DbConnection = Union[sqlite3.Connection, psycopg.Connection]
