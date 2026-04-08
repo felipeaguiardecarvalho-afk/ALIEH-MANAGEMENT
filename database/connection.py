@@ -42,6 +42,7 @@ from typing import Any, Union
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import psycopg
+from psycopg.errors import DuplicatePreparedStatement
 from psycopg.rows import dict_row
 
 from database.config import (
@@ -118,9 +119,31 @@ def _wrap_postgres_cursor_binary_false(conn: psycopg.Connection) -> None:
 
 
 def _apply_pgbouncer_safe_session(conn: psycopg.Connection) -> None:
-    """Limpa estado de sessão (``DISCARD ALL``), características de transação e cursor seguro."""
-    conn.execute("DISCARD ALL;")
-    conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;")
+    """
+    Limpa estado de sessão e força cursores seguros para PgBouncer (pooler Supabase :6543).
+
+    Usa ``cur.execute(..., prepare=False)`` — ``Connection.execute`` pode disparar
+    DuplicatePreparedStatement no modo transação do pooler. Se ``DISCARD ALL`` falhar
+    com esse erro, continua-se sem descarte (ligação ainda utilizável).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DISCARD ALL;", prepare=False)
+    except DuplicatePreparedStatement:
+        _logger.warning(
+            "DISCARD ALL omitido (DuplicatePreparedStatement — pooler transacção); "
+            "estado de sessão pode herdar GUCs do backend."
+        )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;",
+                prepare=False,
+            )
+    except DuplicatePreparedStatement:
+        _logger.warning(
+            "SET SESSION CHARACTERISTICS omitido (DuplicatePreparedStatement — pooler)."
+        )
     _wrap_postgres_cursor_binary_false(conn)
     _logger.info("PgBouncer safe mode enabled (no prepared statements)")
 
