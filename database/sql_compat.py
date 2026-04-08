@@ -126,13 +126,14 @@ def _log_pg_execute_error(sql: str, elapsed_ms: float, exc: BaseException) -> No
 
 
 def db_execute(conn: Any, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()):
-    """``conn.execute`` com SQL adaptado ao provedor activo."""
+    """SQL adaptado ao provedor; Postgres usa cursor com ``prepare=False`` (pooler PgBouncer)."""
     sql_a = adapt_sql(sql)
     if is_sqlite_conn(conn):
         return conn.execute(sql_a, params)
     t0 = time.perf_counter()
     try:
-        cur = conn.execute(sql_a, params)
+        cur = conn.cursor()
+        cur.execute(sql_a, params, prepare=False)
     except Exception as exc:
         _log_pg_execute_error(sql_a, (time.perf_counter() - t0) * 1000, exc)
         raise
@@ -182,7 +183,8 @@ def run_insert_returning_id(conn: Any, sql: str, params: Sequence[Any], pk: str 
     returning_sql = f"{base} RETURNING {pk}"
     t0 = time.perf_counter()
     try:
-        cur = conn.execute(returning_sql, params)
+        cur = conn.cursor()
+        cur.execute(returning_sql, params, prepare=False)
         row = cur.fetchone()
     except Exception as exc:
         _log_pg_execute_error(returning_sql, (time.perf_counter() - t0) * 1000, exc)

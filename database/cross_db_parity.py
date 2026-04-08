@@ -110,7 +110,7 @@ def _exec(conn: Any, sql: str, params: Sequence[Any] = ()) -> Any:
         _pg_cursor_exec_logged = True
     cur = conn.cursor()
     try:
-        cur.execute(sql_use, params)
+        cur.execute(sql_use, params, prepare=False)
         return cur
     except Exception:
         cur.close()

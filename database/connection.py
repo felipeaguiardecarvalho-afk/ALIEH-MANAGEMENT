@@ -42,7 +42,7 @@ from typing import Any, Union
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import psycopg
-from psycopg.errors import DuplicatePreparedStatement
+from psycopg.errors import DuplicatePreparedStatement, InvalidSqlStatementName
 from psycopg.rows import dict_row
 
 from database.config import (
@@ -126,13 +126,15 @@ def _apply_pgbouncer_safe_session(conn: psycopg.Connection) -> None:
     DuplicatePreparedStatement no modo transação do pooler. Se ``DISCARD ALL`` falhar
     com esse erro, continua-se sem descarte (ligação ainda utilizável).
     """
+    _pgbouncer_session_warn_types = (DuplicatePreparedStatement, InvalidSqlStatementName)
     try:
         with conn.cursor() as cur:
             cur.execute("DISCARD ALL;", prepare=False)
-    except DuplicatePreparedStatement:
+    except _pgbouncer_session_warn_types as exc:
         _logger.warning(
-            "DISCARD ALL omitido (DuplicatePreparedStatement — pooler transacção); "
-            "estado de sessão pode herdar GUCs do backend."
+            "DISCARD ALL omitido (%s — pooler / estado de prepared); "
+            "estado de sessão pode herdar GUCs do backend.",
+            type(exc).__name__,
         )
     try:
         with conn.cursor() as cur:
@@ -140,9 +142,10 @@ def _apply_pgbouncer_safe_session(conn: psycopg.Connection) -> None:
                 "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;",
                 prepare=False,
             )
-    except DuplicatePreparedStatement:
+    except _pgbouncer_session_warn_types as exc:
         _logger.warning(
-            "SET SESSION CHARACTERISTICS omitido (DuplicatePreparedStatement — pooler)."
+            "SET SESSION CHARACTERISTICS omitido (%s — pooler).",
+            type(exc).__name__,
         )
     _wrap_postgres_cursor_binary_false(conn)
     _logger.info("PgBouncer safe mode enabled (no prepared statements)")
@@ -196,7 +199,7 @@ def _execute_select_one_health(conn: DbConnection) -> None:
             raise RuntimeError("health probe: unexpected SELECT 1 result (sqlite)")
         return
     with conn.cursor() as cur:
-        cur.execute("SELECT 1 AS ok")
+        cur.execute("SELECT 1 AS ok", prepare=False)
         row = cur.fetchone()
     if row is None:
         raise RuntimeError("health probe: empty row (postgres)")

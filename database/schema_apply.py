@@ -169,7 +169,7 @@ def reset_postgres_schema() -> None:
                 for stmt in statements:
                     _logger.info("Executing statement with isolated cursor")
                     with conn.cursor() as cur:
-                        cur.execute(stmt)
+                        cur.execute(stmt, prepare=False)
     except Exception:
         _logger.exception("reset_postgres_schema falhou (rollback)")
         raise
@@ -185,7 +185,8 @@ def list_public_base_tables(conn) -> list[str]:
             FROM information_schema.tables
             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
             ORDER BY table_name
-            """
+            """,
+            prepare=False,
         )
         rows = cur.fetchall()
     names: list[str] = []
@@ -223,7 +224,7 @@ def apply_schema_to_postgres(*, schema_path: Path | None = None) -> list[str]:
                 for stmt in statements:
                     _logger.info("Executing statement with isolated cursor")
                     with conn.cursor() as cur:
-                        cur.execute(stmt)
+                        cur.execute(stmt, prepare=False)
             tables = list_public_base_tables(conn)
     except Exception:
         _logger.exception("Schema apply failed (transaction rolled back)")

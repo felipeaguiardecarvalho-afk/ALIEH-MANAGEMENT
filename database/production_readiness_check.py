@@ -106,7 +106,8 @@ def run() -> int:
         from database.connection import get_postgres_conn
 
         with get_postgres_conn() as conn:
-            conn.execute("SELECT 1")
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1", prepare=False)
         _logger.info("Postgres connection OK")
         _logger.info("[OK] conexão Postgres")
 

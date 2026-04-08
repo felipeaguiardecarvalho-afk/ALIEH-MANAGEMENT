@@ -8,7 +8,9 @@
 
 **SQLite completo** (ficheiro da BD em uso → cópia consistente via ``backup()`` API):
 
-- Pasta por defeito: ``/backups/db_backups/``; nome ``business_YYYYMMDD_HHMM.db``.
+- Pasta por defeito: ``/backups/db_backups/`` quando gravável; senão
+  ``<repo>/.alieh_data/db_backups/`` ou ``$TMP/alieh_db_backups/`` (ex.: Streamlit Cloud).
+  Nome ``business_YYYYMMDD_HHMM.db``.
 - Arranque (thread), intervalo (``ALIEH_SQLITE_BACKUP_INTERVAL_SECONDS``, defeito 1 h),
   encerramento do processo (``atexit``, síncrono best-effort).
 - Retenção: últimos N ficheiros (``ALIEH_SQLITE_BACKUP_KEEP``, defeito 20).
@@ -26,6 +28,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -49,7 +52,6 @@ _DEFAULT_INTERVAL_S = 86400
 _STATE_NAME = ".audit_backup_state.json"
 
 # --- Backup completo SQLite (ficheiro .db) ---
-_SQLITE_BACKUP_DIR_DEFAULT = Path("/backups/db_backups")
 _STATE_SQLITE_FULL = ".sqlite_full_backup_state.json"
 _DEFAULT_SQLITE_BACKUP_INTERVAL_S = 3600
 _DEFAULT_SQLITE_BACKUP_KEEP = 20
@@ -115,6 +117,25 @@ def _is_backup_disabled() -> bool:
     return False
 
 
+def _resolve_default_sqlite_full_backup_dir() -> Path:
+    """Prefer ``/backups/db_backups`` (Docker); senão caminho gravável no host (nuvem)."""
+    primary = Path("/backups/db_backups")
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except (PermissionError, OSError):
+        pass
+    local = _REPO_ROOT / ".alieh_data" / "db_backups"
+    try:
+        local.mkdir(parents=True, exist_ok=True)
+        return local
+    except (PermissionError, OSError):
+        pass
+    fallback = Path(tempfile.gettempdir()) / "alieh_db_backups"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 def _config_sqlite_full_backup_dir() -> Path:
     env = (os.environ.get("ALIEH_SQLITE_BACKUP_DIR") or "").strip()
     if env:
@@ -122,7 +143,7 @@ def _config_sqlite_full_backup_dir() -> Path:
     sec = _secrets_get("alieh_sqlite_backup_dir")
     if sec:
         return Path(sec).expanduser()
-    return _SQLITE_BACKUP_DIR_DEFAULT
+    return _resolve_default_sqlite_full_backup_dir()
 
 
 def _config_sqlite_full_backup_interval_seconds() -> int:

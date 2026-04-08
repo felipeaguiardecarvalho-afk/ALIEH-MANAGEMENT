@@ -55,7 +55,7 @@ def test_postgres_connection() -> bool:
 
         with get_postgres_conn(silent_probe=True) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1")
+                cur.execute("SELECT 1", prepare=False)
                 row = cur.fetchone()
                 if row is None:
                     _logger.warning("PostgreSQL connection FAILED: empty SELECT 1")
