@@ -8,7 +8,8 @@
 
 No SQLite, o tempo e falhas de ``execute`` são registados em
 :class:`database.timed_sqlite.TimedSqliteConnection`. Aqui regista-se duração e erros em
-``db_execute`` / ``run_insert_returning_id`` para Postgres (placeholders ``%s``).
+``db_execute`` / ``run_insert_returning_id`` / ``db_fetch_all`` / ``db_fetch_one`` para Postgres
+(placeholders ``%s``; linhas como ``dict``).
 """
 
 from __future__ import annotations
@@ -188,7 +189,15 @@ def _log_pg_execute_error(sql: str, elapsed_ms: float, exc: BaseException) -> No
 
 
 def db_execute(conn: Any, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()):
-    """SQL adaptado ao provedor; Postgres usa cursor com ``prepare=False`` (pooler PgBouncer)."""
+    """SQL adaptado ao provedor; Postgres usa cursor com ``prepare=False`` (pooler PgBouncer).
+
+    Devolve o cursor **aberto** para ``fetchone`` / ``fetchall`` / ``rowcount``. Com ligação
+    PostgreSQL e ``row_factory=dict_row``, cada linha é um ``dict`` — use chaves de coluna,
+    não índices numéricos.
+
+    Para leituras que devem fechar o cursor de imediato e devolver ``list[dict]``, use
+    :func:`db_fetch_all` ou :func:`db_fetch_one`.
+    """
     sql_a = adapt_sql(sql)
     if is_sqlite_conn(conn):
         return conn.execute(sql_a, params)
@@ -205,6 +214,90 @@ def db_execute(conn: Any, sql: str, params: Sequence[Any] | Mapping[str, Any] = 
         raise
     _log_pg_duration(sql_a, (time.perf_counter() - t0) * 1000)
     return cur
+
+
+def _materialized_rows_as_dicts(rows: Sequence[Any], description: Any) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    first = rows[0]
+    if isinstance(first, Mapping):
+        return [dict(r) for r in rows]
+    cols = [d[0] for d in (description or [])]
+    return [dict(zip(cols, tuple(r))) for r in rows]
+
+
+def db_fetch_all(
+    conn: Any,
+    sql: str,
+    params: Sequence[Any] | Mapping[str, Any] = (),
+) -> list[dict[str, Any]]:
+    """Executa SELECT e devolve todas as linhas como ``dict`` (cursor fechado no Postgres)."""
+    sql_a = adapt_sql(sql)
+    if is_sqlite_conn(conn):
+        try:
+            cur = conn.execute(sql_a, params)
+            raw = cur.fetchall()
+            desc = cur.description
+        except Exception as exc:
+            _logger.error(
+                "sqlite query failed | %s | %s: %s",
+                _sql_preview(sql_a),
+                type(exc).__name__,
+                exc,
+                exc_info=exc,
+            )
+            raise
+        return _materialized_rows_as_dicts(raw, desc)
+    t0 = time.perf_counter()
+    try:
+        with conn.cursor(binary=False) as cur:
+            cur.execute(sql_a, params, prepare=False)
+            raw = cur.fetchall()
+            desc = cur.description
+    except BaseException as exc:
+        _log_pg_execute_error(sql_a, (time.perf_counter() - t0) * 1000, exc)
+        raise
+    _log_pg_duration(sql_a, (time.perf_counter() - t0) * 1000)
+    return _materialized_rows_as_dicts(raw, desc)
+
+
+def db_fetch_one(
+    conn: Any,
+    sql: str,
+    params: Sequence[Any] | Mapping[str, Any] = (),
+) -> dict[str, Any] | None:
+    """Executa SELECT e devolve uma linha como ``dict`` ou ``None`` (cursor fechado no Postgres)."""
+    sql_a = adapt_sql(sql)
+    if is_sqlite_conn(conn):
+        try:
+            cur = conn.execute(sql_a, params)
+            raw = cur.fetchone()
+            desc = cur.description
+        except Exception as exc:
+            _logger.error(
+                "sqlite query failed | %s | %s: %s",
+                _sql_preview(sql_a),
+                type(exc).__name__,
+                exc,
+                exc_info=exc,
+            )
+            raise
+        if raw is None:
+            return None
+        return _materialized_rows_as_dicts([raw], desc)[0]
+    t0 = time.perf_counter()
+    try:
+        with conn.cursor(binary=False) as cur:
+            cur.execute(sql_a, params, prepare=False)
+            raw = cur.fetchone()
+            desc = cur.description
+    except BaseException as exc:
+        _log_pg_execute_error(sql_a, (time.perf_counter() - t0) * 1000, exc)
+        raise
+    _log_pg_duration(sql_a, (time.perf_counter() - t0) * 1000)
+    if raw is None:
+        return None
+    return _materialized_rows_as_dicts([raw], desc)[0]
 
 def sql_order_ci(column_sql: str) -> str:
     """Expressão para ``ORDER BY`` case-insensitive (sem mudar resultados em dados iguais)."""
@@ -265,4 +358,8 @@ def run_insert_returning_id(conn: Any, sql: str, params: Sequence[Any], pk: str 
         raise RuntimeError("INSERT sem linha em RETURNING.")
     if isinstance(row, Mapping):
         return int(row[pk])
-    return int(row[0])
+    cols = [d[0] for d in (cur.description or [])]
+    if cols and pk in cols:
+        idx = cols.index(pk)
+        return int(tuple(row)[idx])
+    return int(tuple(row)[0])

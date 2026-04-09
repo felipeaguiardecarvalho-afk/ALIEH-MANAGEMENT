@@ -124,15 +124,15 @@ def connect_with_retry(
     *,
     attempts: int = 3,
 ) -> psycopg.Connection:
-    """Abre ligação PostgreSQL com até ``attempts`` tentativas e backoff linear (1s, 2s, …)."""
+    """Abre ligação PostgreSQL com até ``attempts`` tentativas e backoff exponencial (1s, 2s, 4s)."""
     last_exc: BaseException | None = None
     for i in range(attempts):
         try:
             return psycopg.connect(dsn, **connect_kw)
-        except (psycopg.Error, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 — falhas de rede/ssl variadas na ligação inicial
             last_exc = exc
             if i + 1 < attempts:
-                time.sleep(1 * (i + 1))
+                time.sleep(2**i)
     assert last_exc is not None
     raise last_exc
 
@@ -188,8 +188,7 @@ def _get_or_create_cached_conn(dsn: str, connect_kw: dict[str, Any]) -> psycopg.
             _invalidate_cached_conn()
         else:
             try:
-                with _cached_conn.cursor() as cur:
-                    cur.execute("SELECT 1 AS ok", prepare=False)
+                with _cached_conn.execute("SELECT 1 AS ok", prepare=False) as cur:
                     cur.fetchone()
                 _logger.debug("Reusing cached PostgreSQL connection")
                 return _cached_conn
@@ -199,14 +198,14 @@ def _get_or_create_cached_conn(dsn: str, connect_kw: dict[str, Any]) -> psycopg.
                 )
                 _invalidate_cached_conn()
 
-    _logger.info("Connecting to PostgreSQL...")
+    _logger.debug("Connecting to PostgreSQL...")
     conn = connect_with_retry(dsn, connect_kw)
     conn.prepare_threshold = 0
     _wrap_postgres_cursor_binary_false(conn)
     _install_noop_close_for_cache(conn)
     _cached_conn_key = key
     _cached_conn = conn
-    _logger.info("Created new PostgreSQL connection")
+    _logger.debug("Created new cached PostgreSQL connection")
     return conn
 
 
@@ -223,12 +222,11 @@ def _log_using_database_once(kind: str) -> None:
 
 def _execute_select_one_health(conn: DbConnection) -> None:
     """``SELECT 1 AS ok`` com ``dict_row``."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 AS ok", prepare=False)
+    with conn.execute("SELECT 1 AS ok", prepare=False) as cur:
         row = cur.fetchone()
     if row is None:
         raise RuntimeError("health probe: empty row (postgres)")
-    val = row["ok"] if "ok" in row else next(iter(row.values()))
+    val = row["ok"]
     if int(val) != 1:
         raise RuntimeError("health probe: unexpected SELECT 1 result (postgres)")
 

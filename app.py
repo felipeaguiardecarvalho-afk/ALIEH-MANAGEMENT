@@ -2265,6 +2265,7 @@ section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"]
         )
 
         tab_reg, tab_edit = st.tabs(["Cadastrar", "Editar cliente"])
+        customers_page_rows = fetch_customers_ordered()
 
         with tab_reg:
             st.markdown("#### Novo cliente")
@@ -2437,7 +2438,7 @@ section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"]
 
             st.divider()
             st.markdown("#### Todos os clientes")
-            all_cust = fetch_customers_ordered()
+            all_cust = customers_page_rows
             if not all_cust:
                 st.caption("Nenhum cliente ainda.")
             else:
@@ -2462,7 +2463,7 @@ section[data-testid="stSidebar"][style*="translateX(-"] ~ [data-testid="stMain"]
             _cust_del_msg = st.session_state.pop("_cust_deleted_ok", None)
             if _cust_del_msg:
                 st.success(_cust_del_msg)
-            rows_edit = fetch_customers_ordered()
+            rows_edit = customers_page_rows
             if not rows_edit:
                 st.info("Nenhum cliente — cadastre na aba **Cadastrar**.")
             else:

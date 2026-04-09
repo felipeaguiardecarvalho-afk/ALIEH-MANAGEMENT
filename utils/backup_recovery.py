@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,7 +137,7 @@ def verify_export_row_counts_match_db(db_path: Path | str, export_json_path: Pat
     mismatches: list[str] = []
 
     try:
-        conn = sqlite_connect_path(path)
+        conn = sqlite_connect_path(path, row_factory=sqlite3.Row)
     except (ConnectionError, OSError) as exc:
         return [f"Não foi possível abrir a base: {exc}"]
     try:
@@ -150,7 +151,7 @@ def verify_export_row_counts_match_db(db_path: Path | str, export_json_path: Pat
                 continue
             try:
                 cur = conn.execute(f"SELECT COUNT(*) AS n FROM {name};")
-                n = int(cur.fetchone()[0])
+                n = int(cur.fetchone()["n"])
             except DB_DRIVER_ERRORS as exc:
                 mismatches.append(f"{name}: consulta COUNT falhou — {exc}")
                 continue

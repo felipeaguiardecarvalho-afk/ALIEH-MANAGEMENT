@@ -42,7 +42,7 @@ def _seed_catalog(conn: sqlite3.Connection, *, initial_stock: float) -> tuple[in
         """,
         (TENANT, "C00001", "Comprador concorrência", now, now),
     )
-    cust_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    cust_id = int(conn.execute("SELECT last_insert_rowid() AS new_id").fetchone()["new_id"])
 
     conn.execute(
         """
@@ -69,7 +69,7 @@ def _seed_catalog(conn: sqlite3.Connection, *, initial_stock: float) -> tuple[in
             now,
         ),
     )
-    prod_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    prod_id = int(conn.execute("SELECT last_insert_rowid() AS new_id").fetchone()["new_id"])
 
     conn.execute(
         """
@@ -106,9 +106,9 @@ def _read_stock_and_sold(product_id: int) -> tuple[float, int]:
     with sqlite_connect_for_local_schema(connection_mod.DB_PATH) as c:
         st = float(
             c.execute(
-                "SELECT stock FROM products WHERE tenant_id = ? AND id = ?;",
+                "SELECT stock AS stock_qty FROM products WHERE tenant_id = ? AND id = ?;",
                 (TENANT, product_id),
-            ).fetchone()[0]
+            ).fetchone()["stock_qty"]
         )
         row = c.execute(
             """
@@ -125,11 +125,11 @@ def _read_sku_master_total() -> float:
     with sqlite_connect_for_local_schema(connection_mod.DB_PATH) as c:
         v = c.execute(
             """
-            SELECT total_stock FROM sku_master
+            SELECT total_stock AS total_stock_qty FROM sku_master
             WHERE tenant_id = ? AND sku = ?;
             """,
             (TENANT, SKU_CONC),
-        ).fetchone()[0]
+        ).fetchone()["total_stock_qty"]
     return float(v)
 
 

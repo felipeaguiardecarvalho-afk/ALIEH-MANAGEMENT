@@ -21,7 +21,7 @@ from database.queries import (
     fetch_products as _fetch_products_uncached,
     fetch_recent_stock_cost_entries,
     fetch_sales_date_bounds,
-    fetch_skus_available_for_sale,
+    fetch_skus_available_for_sale as _fetch_skus_available_for_sale_uncached,
     fetch_sku_cost_components_for_sku,
     fetch_sku_master_rows as _fetch_sku_master_rows_uncached,
     fetch_sku_pricing_records_for_sku,
@@ -33,19 +33,24 @@ from database.queries import (
 )
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_customers_ordered(tenant_id: str | None = None) -> list:
     return _fetch_customers_ordered_uncached(tenant_id=tenant_id)
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_products(tenant_id: str | None = None):
     return _fetch_products_uncached(tenant_id=tenant_id)
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_sku_master_rows(tenant_id: str | None = None):
     return _fetch_sku_master_rows_uncached(tenant_id=tenant_id)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_skus_available_for_sale(tenant_id: str | None = None):
+    return _fetch_skus_available_for_sale_uncached(tenant_id=tenant_id)
 
 
 __all__ = [

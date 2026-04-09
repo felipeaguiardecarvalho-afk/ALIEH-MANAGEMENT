@@ -36,7 +36,7 @@ def test_check_database_health_returns_true_when_postgres_ok(reload_conn, monkey
     mock_conn = MagicMock()
     mock_conn.__enter__ = MagicMock(return_value=mock_conn)
     mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value = cur
+    mock_conn.execute.return_value = cur
 
     with patch.object(conn_mod, "get_db_conn", return_value=mock_conn):
         assert conn_mod.check_database_health() is True
