@@ -14,6 +14,8 @@
   ``prepare_threshold=0``, ``autocommit=True`` — sem comandos de sessão pós-conexão (compatível
   com PgBouncer / Supabase). Transacções explícitas usam ``conn.transaction()``. Cursores por
   defeito ``binary=False``. ``connect_timeout`` (defeito 10 s; override ``DATABASE_CONNECT_TIMEOUT``).
+  Uma ligação por processo é reutilizada entre reruns Streamlit (cache com ``SELECT 1``); o
+  ``close()`` na instância cacheada é um no-op para que ``with get_db_conn()`` não destrua o socket.
 
 Na primeira ligação por processo: ``Active database backend=postgresql`` (alvo mascarado) e
 ``PostgreSQL connection established (PgBouncer safe mode)``.
@@ -49,6 +51,11 @@ DATABASE_HEALTH_INTERVAL_SECONDS_ENV = "DATABASE_HEALTH_INTERVAL_SECONDS"
 _first_postgres_connection_log_done = False
 _using_database_logged: str | None = None
 _last_periodic_health_monotonic: float = 0.0
+
+# Cache ao nível do processo (Streamlit reruns). Ver :func:`_get_or_create_cached_conn`.
+_cached_conn: psycopg.Connection | None = None
+_cached_conn_real_close: Any | None = None
+_cached_conn_key: tuple[Any, ...] | None = None
 
 SQLITE_DB_FILENAME = "business.db"
 
@@ -96,6 +103,72 @@ def _wrap_postgres_cursor_binary_false(conn: psycopg.Connection) -> None:
         return real(*args, **kwargs)
 
     conn.cursor = cursor  # type: ignore[method-assign]
+
+
+def _connection_cache_key(dsn: str, connect_kw: dict[str, Any]) -> tuple[Any, ...]:
+    """Chave para invalidar cache se DSN ou parâmetros efectivos de ligação mudarem."""
+    return (
+        dsn,
+        connect_kw.get("sslmode"),
+        connect_kw.get("hostaddr"),
+        connect_kw.get("connect_timeout"),
+        connect_kw.get("autocommit"),
+        connect_kw.get("prepare_threshold"),
+        connect_kw.get("row_factory") is dict_row,
+    )
+
+
+def _invalidate_cached_conn() -> None:
+    """Fecho real e limpeza do singleton (ligação morta ou parâmetros alterados)."""
+    global _cached_conn, _cached_conn_real_close, _cached_conn_key
+    if _cached_conn is None:
+        _cached_conn_key = None
+        return
+    close_fn = _cached_conn_real_close
+    _cached_conn = None
+    _cached_conn_real_close = None
+    _cached_conn_key = None
+    if close_fn is not None:
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
+def _install_noop_close_for_cache(conn: psycopg.Connection) -> None:
+    """Evita que ``with conn`` / ``conn.close()`` destruam o socket partilhado entre reruns."""
+    global _cached_conn_real_close
+
+    _cached_conn_real_close = conn.close
+
+    def _noop_close(*_a: Any, **_k: Any) -> None:
+        return None
+
+    conn.close = _noop_close  # type: ignore[method-assign]
+
+
+def _get_or_create_cached_conn(dsn: str, connect_kw: dict[str, Any]) -> psycopg.Connection:
+    global _cached_conn, _cached_conn_key
+    key = _connection_cache_key(dsn, connect_kw)
+    if _cached_conn is not None and _cached_conn_key != key:
+        _invalidate_cached_conn()
+
+    if _cached_conn is not None:
+        try:
+            with _cached_conn.cursor() as cur:
+                cur.execute("SELECT 1", prepare=False)
+            _logger.debug("Reusing cached PostgreSQL connection")
+            return _cached_conn
+        except Exception:
+            _invalidate_cached_conn()
+
+    conn = psycopg.connect(dsn, **connect_kw)
+    conn.prepare_threshold = 0
+    _wrap_postgres_cursor_binary_false(conn)
+    _install_noop_close_for_cache(conn)
+    _cached_conn_key = key
+    _cached_conn = conn
+    return conn
 
 
 def _log_using_database_once(kind: str) -> None:
@@ -282,7 +355,7 @@ def _require_postgres_dsn() -> str:
 
 
 def get_postgres_conn(*, silent_probe: bool = False) -> psycopg.Connection:
-    """Nova ligação Postgres (psycopg 3): ``DATABASE_URL`` / fallbacks.
+    """Ligação Postgres (psycopg 3): ``DATABASE_URL`` / fallbacks; reuse por processo (Streamlit).
 
     ``prepare_threshold=0`` e ``sslmode`` no DSN (Supabase: ``require``). Sem ``DISCARD ALL`` nem
     outros comandos de sessão após conectar (evita ``DuplicatePreparedStatement`` com PgBouncer).
@@ -316,9 +389,7 @@ def get_postgres_conn(*, silent_probe: bool = False) -> psycopg.Connection:
         if hostaddr:
             connect_kw["hostaddr"] = hostaddr
     try:
-        conn = psycopg.connect(dsn, **connect_kw)
-        # Reforço: alguns edge cases com pooler ignoram o kwarg na abertura.
-        conn.prepare_threshold = 0
+        conn = _get_or_create_cached_conn(dsn, connect_kw)
     except (psycopg.Error, OSError) as exc:
         _logger.error(
             "PostgreSQL connection FAILED: %s - %s | repr=%r",
@@ -330,7 +401,6 @@ def get_postgres_conn(*, silent_probe: bool = False) -> psycopg.Connection:
         raise ConnectionError(
             "Não foi possível ligar à base PostgreSQL. Verifique o DSN e a rede."
         ) from exc
-    _wrap_postgres_cursor_binary_false(conn)
     if not silent_probe and not _first_postgres_connection_log_done:
         _logger.info("PostgreSQL connection established (PgBouncer safe mode)")
         _first_postgres_connection_log_done = True

@@ -68,9 +68,11 @@ Nota: este ficheiro não contém URIs nem passwords (credenciais só .env / secr
     migrações e testes — ``sqlite_connect_for_local_schema(DB_PATH)``. Pastas: ``/data``,
     ``.alieh_data`` ou tempfile; backups podem usar destino alternativo se ``/backups`` falhar.
 
-  • schema_apply: instruções com cursor e ``prepare=False`` por declaração.
+  • schema_apply: cursor + ``prepare=False`` por instrução; CLI ``--full-reset`` recria ``public`` a partir
+    de ``schema.sql`` + grants Supabase (API roles); ver ``python -m database.schema_apply --help``.
+    DDL pesado: DSN directo :5432.
 
-  • migrate_sqlite_to_postgres: caminhos absolutos; --full-reset opcional.
+  • migrate_sqlite_to_postgres: caminhos absolutos; --full-reset opcional (cópia de dados).
 
 
 5. OBSERVABILIDADE — SAÚDE, QUERIES, SOMBRA, PARIDADE

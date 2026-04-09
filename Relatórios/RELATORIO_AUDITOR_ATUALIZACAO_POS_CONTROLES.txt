@@ -64,6 +64,8 @@ para amostragem, walkthrough, avaliação de risco residual e planeamento de evo
     **Shadow:** `database/shadow_mode.py` — `sqlite3.connect` no espelho **apenas** se `ALIEH_ALLOW_RUNTIME_SQLITE=1`
     (além de `ALIEH_DB_SHADOW_MODE` / `ALIEH_DB_SHADOW_SQLITE`). **DB_PATH** / SQLite mantêm-se para `init_db` (sqlite),
     migrações, export e testes. **Smoke pré-deploy:** `python -m database.test_postgres_runtime` (esperado `(1,)`).
+    **DDL / recriação de schema:** `python -m database.schema_apply --full-reset` (apaga `public`; usar DSN
+    directo :5432 no Supabase; opções `--supabase`, `--no-supabase-grants` — ver docstring do módulo).
 
   **Repositório de testes automatizados (pytest)**
   - **72** testes colectados; suíte habitual **71 passed, 1 skipped** (comando típico: `python -m pytest tests/ -q --ignore=tests/test_postgres_integration.py`).

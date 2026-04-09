@@ -105,10 +105,15 @@ RESUMO EXECUTIVO
 
 6. SCHEMA E PARIDADE
 --------------------------------------------------------------------------------
-  reset_postgres_schema / apply_schema_to_postgres — database/schema_apply.py
+  database/schema_apply.py — aplica ``schema.sql`` ao Postgres; CLI:
+    • ``python -m database.schema_apply`` — só DDL do ficheiro;
+    • ``python -m database.schema_apply --full-reset`` — ``DROP SCHEMA public CASCADE`` + DDL completo
+      (detecta Supabase pelo DSN; grants ``anon``/``authenticated``/``service_role`` após tabelas);
+    • ``--supabase`` / ``--no-supabase-grants`` — forçar ou omitir grants API.
+    Preferir URI **directa** Supabase (porta 5432) para DDL pesado; **apaga todos os dados** em ``public``.
   validate_postgres_schema — database/schema_validate.py
   compare_sqlite_postgres — database/cross_db_parity.py (ligação dedicada; cursor + prepare=False)
-  migrate_sqlite_to_postgres.py — caminhos absolutos; opcional --full-reset
+  migrate_sqlite_to_postgres.py — caminhos absolutos; opcional --full-reset (migração de dados)
 
 
 7. TESTES

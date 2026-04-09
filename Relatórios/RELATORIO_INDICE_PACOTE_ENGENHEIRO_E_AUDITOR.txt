@@ -1,0 +1,79 @@
+================================================================================
+ÍNDICE — PACOTE COMPLETO DE RELATÓRIOS (ENGENHEIRO + AUDITOR)
+ALIEH management · Actualização: Abril 2026
+================================================================================
+Este ficheiro lista todos os relatórios sob Relatórios/ e a finalidade de cada um.
+O conteúdo integral está nos .txt referenciados (abrir no editor ou anexar à auditoria).
+
+Nota: não incluir credenciais, URIs com password nem dados pessoais nas versões partilhadas.
+
+
+────────────────────────────────────────────────────────────────────────────────
+A) ENGENHEIRO — LEITURA RECOMENDADA (ordem)
+────────────────────────────────────────────────────────────────────────────────
+
+  1. RELATORIO_STATUS_ENGENHEIRO.txt
+     Visão operacional: Postgres-only na app, ligação pooler-safe, init_db/SQLite,
+     shadow, testes, health checks, schema_apply CLI, checklist.
+
+  2. RELATORIO_ENGENHEIRO_SUPABASE_CONFIG.txt
+     Integração Supabase/Postgres: .env, get_db_conn, observabilidade, RLS/campos
+     fora do psycopg (JS), testes, checklist de deploy.
+
+  3. RELATORIO_PRODUCTION_READINESS_CHECK.txt
+     Módulo python -m database.production_readiness_check: gate CI/manual antes
+     de produção (tenant sintético, cleanup).
+
+  4. RELATORIO_COMPLETO_CODIGO_E_TESTES.txt
+     Inventário largo de código e testes (onboarding; cruzar com relatórios mais
+     recentes — algumas frases podem descrever estado legado SQLite-first).
+
+
+────────────────────────────────────────────────────────────────────────────────
+B) AUDITOR — LEITURA RECOMENDADA (ordem)
+────────────────────────────────────────────────────────────────────────────────
+
+  1. RELATORIO_AUDITOR_ATUALIZACAO_POS_CONTROLES.txt  ★ principal pormenorizado
+     Camadas app/services, Estoque, baixa manual, multi-tenant, auth, observabilidade
+     Postgres, matriz de testes, referências de ficheiro/função.
+
+  2. RELATORIO_SEGURANCA_AUDITOR.txt
+     Validação de entrada, Supabase JS, SQLite legado, nota de leitura sobre Postgres
+     em produção (cruzamento com o relatório pós-controlos).
+
+  3. RELATORIO_AUDITOR_PREPARACAO_SUPABASE.txt
+     Preparação cutover Supabase, riscos, dual-mode histórico — usar como complemento;
+     alinhar com get_db_conn exclusivo Postgres na app.
+
+  4. RELATORIO_AUDITORIA_COMPLETO_20260404.txt
+     Snapshot de verificação pytest / ambiente (data no nome); nota de working tree.
+
+  5. RELATORIO_UAT_E_AUDITORIA_CONSOLIDADO.txt
+     UAT manual, matrizes de risco e cruzamentos com testes automáticos.
+
+  6. RELATORIO_PRODUCTION_READINESS_CHECK.txt
+     Idêntico ao item A3 — evidência de fluxo de negócio em Postgres (auditor pode
+     reproduzir o procedimento).
+
+
+────────────────────────────────────────────────────────────────────────────────
+C) FICHEIROS ADICIONAIS NO MESMO DIRECTÓRIO
+────────────────────────────────────────────────────────────────────────────────
+
+  • RELATORIO_INDICE_PACOTE_ENGENHEIRO_E_AUDITOR.txt  (este índice)
+
+
+────────────────────────────────────────────────────────────────────────────────
+Comandos úteis (evidência rápida; sem expor secrets)
+────────────────────────────────────────────────────────────────────────────────
+
+  python -m database.test_postgres_runtime
+  python -m database.health_check
+  python -m pytest tests/ -q --ignore=tests/test_postgres_integration.py
+  python -m database.schema_apply --help
+  python -m database.production_readiness_check   (requer env Postgres completo)
+
+
+================================================================================
+Fim do índice
+================================================================================
