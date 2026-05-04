@@ -49,8 +49,11 @@ export async function DashboardDataSection({ query }: { query: DashboardQuery })
           <CardTitle className="text-destructive">Painel indisponível</CardTitle>
           <CardDescription>{msg}</CardDescription>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">
-          Verifique <code className="rounded bg-muted px-1">API_PROTOTYPE_URL</code> e a sessão.
+        <CardContent className="space-y-2 text-sm text-muted-foreground">
+          <p>
+            Verifique <code className="rounded bg-muted px-1">API_PROTOTYPE_URL</code>, se a FastAPI está a correr na
+            porta correcta e a sessão.
+          </p>
         </CardContent>
       </Card>
     );

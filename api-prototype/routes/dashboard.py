@@ -12,7 +12,7 @@ from database.repositories.support import use_connection
 from database.repositories import query_repository as qr
 from database.sql_compat import db_execute
 from database.tenancy import effective_tenant_id_for_request
-from deps import Actor, get_actor
+from deps import Actor, get_actor_read
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -204,7 +204,7 @@ def _build_insights(
 
 
 @router.get("/filters")
-def get_dashboard_filters(actor: Actor = Depends(get_actor)):
+def get_dashboard_filters(actor: Actor = Depends(get_actor_read)):
     tid = effective_tenant_id_for_request(actor.tenant_id)
     with use_connection(None) as conn:
         sku_rows = db_execute(
@@ -275,7 +275,7 @@ def get_dashboard_panel(
     active_customer_days: str = Query(
         "90", description="7–365 rolling window ending at date_end"
     ),
-    actor: Actor = Depends(get_actor),
+    actor: Actor = Depends(get_actor_read),
 ):
     try:
         end = (

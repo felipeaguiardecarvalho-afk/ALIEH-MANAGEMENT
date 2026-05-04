@@ -1,6 +1,6 @@
 import "server-only";
 
-import { apiPrototypeFetch, readApiError } from "@/lib/api-prototype";
+import { apiPrototypeFetchRead, readApiError } from "@/lib/api-prototype";
 import type { DashboardQuery } from "@/lib/dashboard-url";
 
 export type DashboardFilterOptions = {
@@ -152,7 +152,7 @@ function panelQueryString(q: DashboardQuery): string {
 }
 
 export async function fetchPrototypeDashboardFilters(): Promise<DashboardFilterOptions> {
-  const res = await apiPrototypeFetch("/dashboard/filters");
+  const res = await apiPrototypeFetchRead("/dashboard/filters");
   if (!res.ok) throw new Error(await readApiError(res));
   return (await res.json()) as DashboardFilterOptions;
 }
@@ -160,7 +160,7 @@ export async function fetchPrototypeDashboardFilters(): Promise<DashboardFilterO
 export async function fetchPrototypeDashboardPanel(
   q: DashboardQuery
 ): Promise<DashboardPanelResponse> {
-  const res = await apiPrototypeFetch(`/dashboard/panel${panelQueryString(q)}`, {
+  const res = await apiPrototypeFetchRead(`/dashboard/panel${panelQueryString(q)}`, {
     cache: "no-store",
   });
   if (!res.ok) throw new Error(await readApiError(res));

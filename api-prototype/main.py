@@ -22,6 +22,14 @@ if str(_PROTOTYPE_DIR) not in sys.path:
 if str(_ROOT) not in sys.path:
     sys.path.insert(1, str(_ROOT))
 
+# Mesmo .env da raiz do monorepo que o Streamlit / gate — uvicorn a partir de api-prototype/ não o carrega sozinho.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(_ROOT / ".env", override=False)
+except ImportError:
+    pass
+
 from fastapi import FastAPI, HTTPException
 from fastapi.exception_handlers import http_exception_handler
 from starlette.requests import Request

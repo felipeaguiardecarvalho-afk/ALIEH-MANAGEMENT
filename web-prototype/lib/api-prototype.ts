@@ -43,6 +43,41 @@ export function getPrototypeApiBase(): string {
   return base;
 }
 
+function isLikelyConnectionFailure(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  const msg = (e.message || "").toLowerCase();
+  if (msg.includes("fetch failed") || msg.includes("network error")) return true;
+  const c = e.cause;
+  if (c instanceof Error) {
+    const cm = (c.message || "").toLowerCase();
+    if (cm.includes("econnrefused") || cm.includes("enotfound") || cm.includes("eai_again")) return true;
+    const code = typeof (c as { code?: unknown }).code === "string" ? (c as { code: string }).code : "";
+    if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "ETIMEDOUT") return true;
+  }
+  return false;
+}
+
+async function prototypeUndiciFetch(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (isLikelyConnectionFailure(e)) {
+      let origin: string;
+      try {
+        origin = new URL(url).origin;
+      } catch {
+        origin = "a API configurada em API_PROTOTYPE_URL";
+      }
+      throw new Error(
+        `Sem ligação à api-prototype (${origin}). ` +
+          "Na raiz do repositório: npm run dev:api (só FastAPI) ou npm run dev:stack (API + Next). " +
+          "Confirme API_PROTOTYPE_URL em web-prototype/.env.local (ex.: http://127.0.0.1:8000).",
+      );
+    }
+    throw e;
+  }
+}
+
 /** Mutações via `apiPrototypeFetch` não exigem `DATABASE_URL` no Next — só a API. */
 export function hasPrototypeApiUrl(): boolean {
   return Boolean(process.env.API_PROTOTYPE_URL?.trim());
@@ -153,7 +188,7 @@ export async function apiPrototypeFetchRead(
   }
   attachInternalPrototypeSecret(headers);
   // Node/undici reuses keep-alive connections to the same API host by default.
-  return fetch(url, {
+  return prototypeUndiciFetch(url, {
     ...rest,
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
@@ -175,7 +210,7 @@ export async function apiPrototypeFetch(
   }
   attachInternalPrototypeSecret(headers);
   // Node/undici reuses keep-alive connections to the same API host by default.
-  return fetch(url, {
+  return prototypeUndiciFetch(url, {
     ...rest,
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,

@@ -31,12 +31,13 @@ export async function DashboardFilters({ query }: { query: DashboardQuery }) {
   let options: Awaited<ReturnType<typeof fetchPrototypeDashboardFilters>>;
   try {
     options = await fetchPrototypeDashboardFilters();
-  } catch {
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Não foi possível carregar listas para filtro (API).";
     return (
       <Card className="border-destructive/50">
         <CardHeader>
           <CardTitle className="text-destructive">Filtros indisponíveis</CardTitle>
-          <CardDescription>Não foi possível carregar listas para filtro (API).</CardDescription>
+          <CardDescription className="whitespace-pre-wrap">{msg}</CardDescription>
         </CardHeader>
       </Card>
     );

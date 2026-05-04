@@ -5,11 +5,14 @@ Esta pasta é a **única UI Next.js** a tratar como protótipo de produto. Corre
 ## Arranque
 
 ```bash
-# a partir da raiz do monorepo (recomendado)
+# a partir da raiz do monorepo (recomendado): Next + FastAPI em simultâneo
 cd ..
+npm run dev:stack
+
+# só Next (precisa da API já a correr noutro terminal: npm run dev:api)
 npm run dev
 
-# ou só aqui
+# ou só nesta pasta
 npm run dev
 ```
 
@@ -17,7 +20,8 @@ npm run dev
 
 ## API
 
-O protótipo consome **`api-prototype/`** (FastAPI), tipicamente `http://127.0.0.1:8000`. Definir `API_PROTOTYPE_URL` em `.env.local`.
+O protótipo consome **`api-prototype/`** (FastAPI), tipicamente `http://127.0.0.1:8000`. Definir `API_PROTOTYPE_URL` em `.env.local`.  
+Se o painel mostrar erro de ligação, na raiz do repo: **`npm run dev:api`** ou **`npm run dev:stack`**.
 
 ## Documentação global
 

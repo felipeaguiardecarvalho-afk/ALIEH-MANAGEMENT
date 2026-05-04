@@ -3,6 +3,7 @@
   "scripts": {
     "dev": "npm --prefix web-prototype run dev",
     "dev:api": "cd api-prototype && python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000",
+    "dev:stack": "concurrently -k -n api,web -c blue,magenta \"npm run dev:api\" \"npm run dev:prototype\"",
     "dev:prototype": "npm --prefix web-prototype run dev",
     "dev:root": "next dev -p 3001",
     "build": "next build",
@@ -41,6 +42,7 @@
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "concurrently": "^9.2.1",
     "tailwindcss": "latest",
     "typescript": "latest"
   }
