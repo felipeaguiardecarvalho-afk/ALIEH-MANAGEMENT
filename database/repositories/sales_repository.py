@@ -11,7 +11,7 @@ from database.connection import DbConnection
 from database.repositories.support import use_connection
 from database.sale_codes import _next_sale_sequence, format_sale_code
 from database.sku_master_repo import sync_sku_master_totals
-from database.sql_compat import db_execute
+from database.sql_compat import db_execute, is_sqlite_conn
 from database.tenancy import effective_tenant_id_for_request
 
 __all__ = [
@@ -41,19 +41,25 @@ def get_product_row_for_sale(
     conn: DbConnection | None,
     product_id: int,
     tenant_id: str | None = None,
+    *,
+    for_update: bool = False,
 ):
+    """``for_update=True`` bloqueia a linha de ``products`` na transacção (PostgreSQL)."""
     with use_connection(conn) as c:
         tid = effective_tenant_id_for_request(tenant_id)
+        lock_sql = ""
+        if for_update and not is_sqlite_conn(c):
+            lock_sql = " FOR UPDATE OF p"
         return db_execute(
             c,
-            """
+            f"""
             SELECT p.stock, p.sku, p.deleted_at AS p_del,
                    sm.deleted_at AS sm_del,
                    COALESCE(sm.selling_price, 0) AS sp,
                    COALESCE(sm.avg_unit_cost, 0) AS avg_cogs
             FROM products p
             LEFT JOIN sku_master sm ON sm.sku = p.sku AND sm.tenant_id = p.tenant_id
-            WHERE p.tenant_id = %s AND p.id = %s;
+            WHERE p.tenant_id = %s AND p.id = %s{lock_sql};
             """,
             (tid, product_id),
         ).fetchone()
@@ -76,11 +82,26 @@ def create_sale_with_stock_decrement(
 ) -> tuple[str, float]:
     with use_connection(conn) as c:
         tid = effective_tenant_id_for_request(tenant_id)
-        db_execute(
+        cur = db_execute(
             c,
-            "UPDATE products SET stock = stock - %s WHERE tenant_id = %s AND id = %s;",
-            (qty, tid, product_id),
+            """
+            UPDATE products
+            SET stock = stock - %s
+            WHERE tenant_id = %s AND id = %s AND deleted_at IS NULL AND stock >= %s
+            RETURNING stock;
+            """,
+            (qty, tid, product_id, qty),
         )
+        if cur.fetchone() is None:
+            from utils.error_messages import format_insufficient_stock
+
+            probe = db_execute(
+                c,
+                "SELECT stock FROM products WHERE tenant_id = %s AND id = %s;",
+                (tid, product_id),
+            ).fetchone()
+            avail = float(probe["stock"] or 0) if probe else 0.0
+            raise ValueError(format_insufficient_stock(avail))
         sync_sku_master_totals(c, sku, tenant_id=tid)
 
         seq_n = _next_sale_sequence(c, tid)

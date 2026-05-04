@@ -1,0 +1,38 @@
+{
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000 --webpack",
+    "dev:turbo": "next dev -p 3000 --turbopack",
+    "dev:fresh": "npx --yes kill-port 3000 && next dev -p 3000 --webpack",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test:customers": "node --env-file=.env scripts/testCreateCustomer.js",
+    "test:e2e": "npm --prefix ../tests/e2e run test",
+    "test:e2e:ui": "npm --prefix ../tests/e2e run test:ui"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.105.1",
+    "@tanstack/react-table": "latest",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
+    "jose": "^5.10.0",
+    "lucide-react": "latest",
+    "next": "latest",
+    "postgres": "latest",
+    "radix-ui": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "server-only": "latest",
+    "tailwind-merge": "latest",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest"
+  }
+}

@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+/**
+ * Design tokens — contrast-first dark theme.
+ * Semantic aliases (below) mirror @theme for clarity and reuse outside Tailwind.
+ */
+@theme inline {
+  /* Page vs surface: clearer separation without heavy shadows */
+  --color-background: oklch(0.072 0.004 82);
+  --color-foreground: oklch(0.985 0.004 82);
+  --color-card: oklch(0.152 0.012 82);
+  --color-card-foreground: oklch(0.985 0.004 82);
+  /* Form controls: between page and card so fields stay visible on both */
+  --color-field: oklch(0.118 0.01 82);
+  --color-popover: oklch(0.165 0.014 82);
+  --color-popover-foreground: oklch(0.985 0.004 82);
+  /* Primary CTA: higher L/C for AA on dark surfaces */
+  --color-primary: oklch(0.805 0.128 82);
+  --color-primary-foreground: oklch(0.14 0.03 82);
+  --color-secondary: oklch(0.26 0.01 82);
+  --color-secondary-foreground: oklch(0.97 0.004 82);
+  --color-muted: oklch(0.225 0.012 82);
+  /* Secondary copy: ~WCAG AA vs card, still clearly below primary */
+  --color-muted-foreground: oklch(0.78 0.022 85);
+  --color-accent: oklch(0.255 0.012 82);
+  --color-accent-foreground: oklch(0.97 0.004 82);
+  --color-destructive: oklch(0.62 0.21 25);
+  /* Borders / inputs: avoid “invisible” edges on #0a…#12 surfaces */
+  --color-border: oklch(0.36 0.018 82);
+  --color-input: oklch(0.34 0.016 82);
+  --color-ring: oklch(0.805 0.128 82);
+  --radius: 0.875rem;
+  --font-sans: "Inter", "Inter Fallback", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Playfair Display", "Playfair Display Fallback", ui-serif, Georgia, serif;
+}
+
+:root {
+  --text-primary: var(--color-foreground);
+  --text-secondary: var(--color-muted-foreground);
+  --text-muted: var(--color-muted-foreground);
+  --background-primary: var(--color-background);
+  --background-surface: var(--color-card);
+  --background-field: var(--color-field);
+  --border-subtle: var(--color-border);
+  --border-strong: oklch(0.46 0.02 82);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(199, 163, 91, 0.14), transparent 32rem),
+    linear-gradient(180deg, oklch(0.065 0.004 82) 0%, oklch(0.1 0.006 82) 44%, oklch(0.06 0.004 82) 100%);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+/* Placeholders inherit muted color at full opacity (browser default fades them). */
+input::placeholder,
+textarea::placeholder {
+  opacity: 1;
+  color: var(--color-muted-foreground);
+}
+
+::selection {
+  background: rgba(199, 163, 91, 0.35);
+}

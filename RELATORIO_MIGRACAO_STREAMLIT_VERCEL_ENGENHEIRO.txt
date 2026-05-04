@@ -1,0 +1,276 @@
+================================================================================
+RELATORIO TECNICO — MIGRACAO ALIEH MANAGEMENT
+De Streamlit para deploy na Vercel (UI, performance e eficiencia)
+================================================================================
+Data de elaboracao: 2026-05-02
+Publico-alvo: Engenheiro de software (planejamento de migracao e arquitetura)
+Repositorio analisado: ALIEH management (workspace local)
+================================================================================
+
+1. OBJETIVO DESTE DOCUMENTO
+--------------------------------------------------------------------------------
+Fornecer um inventario fiel do sistema atual, as limitacoes do modelo Streamlit
+em relacao aos objetivos de negocio (visual, velocidade, escalabilidade) e um
+quadro de decisao para o engenheiro montar um plano de migracao para a
+plataforma Vercel.
+
+Este relatorio NAO substitui estimativas de prazo da equipa; define escopo
+tecnico, riscos e fases sugeridas.
+
+
+2. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+O produto atual e uma aplicacao monolitica em Python com Streamlit (`app.py`,
+~3300+ linhas) que concentra gestao comercial: painel executivo, produtos,
+custos, precificacao, estoque, clientes, vendas e checklist UAT. A persistencia
+em producao esta alinhada a PostgreSQL (Supabase), com camada de servicos e
+repositorios reutilizaveis. Existe tambem um dashboard Streamlit menor em
+`streamlit_app/app.py` e um utilitario em `alieh_supabase/app/main.py`.
+
+A Vercel hospeda nativamente runtimes Node.js (Next.js, etc.) e funcoes serverless;
+NAO hospeda aplicacoes Streamlit como stack principal. A migracao implica
+substituir a camada de UI e o modelo de execucao (reruns Python no servidor por
+cada interacao) por uma aplicacao web moderna (tipicamente Next.js) na Vercel,
+com chamadas a API/Server Actions e eventualmente um backend Python separado
+OU reimplementacao da logica em TypeScript com acesso direto ao Postgres.
+
+Ganhos esperados apos migracao bem feita:
+- Interface: componentes React, design system (ex.: shadcn/ui), layouts
+  responsivos e acessibilidade superiores ao HTML/CSS injetado no Streamlit.
+- Velocidade percebida: navegacao por rotas sem reexecutar todo o script;
+  carregamento parcial (streaming, Suspense); cache HTTP e de dados na edge.
+- Eficiencia de servidor: menos CPU por clique (sem re-renderizar toda a arvore
+  Streamlit); conexoes a BD geridas por pooling serverless (PgBouncer / Supabase).
+
+
+3. INVENTARIO DO SISTEMA ATUAL (BASEADO NO CODIGO)
+--------------------------------------------------------------------------------
+
+3.1 Entrada principal da aplicacao de gestao
+- Ficheiro: `app.py` (raiz do projeto).
+- Framework: Streamlit (`streamlit`), `pandas`, `plotly`, `psycopg`.
+- Fluxo: `main()` chama `run_database_init()`, backups periodicos, health check,
+  `ensure_authenticated_or_stop()`, injeta CSS (fonte Montserrat via Google Fonts),
+  define navegacao lateral `st.sidebar.radio` com modulos listados abaixo.
+
+3.2 Modulos de navegacao (equivalente a "paginas" da app)
+Constantes em `app.py`:
+- Painel
+- Produtos
+- Custos
+- Precificacao
+- Estoque
+- Clientes
+- Vendas
+- Checklist UAT
+
+Cada modulo corresponde a blocos extensos de UI Streamlit (formularios, tabelas,
+selectboxes, expanders) acoplados a funcoes em `services/*` e `database/*`.
+
+3.3 Painel executivo (BI)
+- Ficheiro: `utils/painel_dashboard.py`.
+- Usa `st.cache_data(ttl=120)` para KPIs e consultas agregadas.
+- Dependencias: `analytics/metrics.py`, `analytics/transformations.py`,
+  `services/read_queries.py`, `ui/components.py` (componentes visuais BI em
+  contexto Streamlit).
+
+3.4 Base de dados e configuracao
+- `database/connection.py`: ligacao PostgreSQL com `psycopg`, `prepare_threshold=0`,
+  reutilizacao de conexao por processo (cache entre reruns Streamlit), modo
+  compativel com PgBouncer/Supabase.
+- `database/config.py`: resolucao de DSN (`DATABASE_URL`, `SUPABASE_DB_URL`, etc.),
+  deteccao de ambiente Streamlit Cloud (`/mount/src/`), flags de producao.
+
+3.5 Autenticacao e autorizacao
+- Ficheiro: `utils/app_auth.py`.
+- Modos: utilizadores na tabela `users` (prioritario) ou credenciais legacy via
+  env/Secrets; sessao em `st.session_state`; RBAC (`admin`, `operator`);
+  multi-inquilino (`get_session_tenant_id`, `effective_tenant_id_for_request`).
+- Throttling de login: `database/login_throttle_repo.py` (SQLite ou BD — ver
+  implementacao; em migracao web, equivalente deve ser por IP + utilizador ou
+  servico dedicado).
+
+3.6 Outras aplicacoes Streamlit no repositorio
+- `streamlit_app/app.py`: dashboard simplificado (metricas de vendas, grafico
+  Plotly de receita 30 dias); segredo `DATABASE_URL` em `.streamlit/secrets.toml`.
+- `alieh_supabase/app/main.py`: pagina de estado / cliente Supabase (URL + anon
+  key), espelhamento de segredos Streamlit para variaveis de ambiente.
+
+3.7 Upload de ficheiros
+- `app.py` usa `st.file_uploader` (pelo menos em contexto de produtos/lotes).
+  Implicacao para Vercel: limites de tamanho em serverless; armazenamento deve
+  ir para Supabase Storage, Vercel Blob ou S3 — nao para disco efemero da funcao.
+
+3.8 Dependencias Python (raiz)
+- `requirements.txt` inclui: streamlit, pandas, plotly, psycopg, supabase,
+  python-dotenv, pytest.
+
+3.9 Testes
+- Pasta `tests/` com cobertura de base de dados, vendas, RBAC, backups, etc.
+  O plano de migracao deve preservar invariantes de negocio testadas aqui ou
+  portar testes para a nova stack (e2e + contratos de API).
+
+
+4. POR QUE O MODELO STREAMLIT LIMITA VISUAL E VELOCIDADE
+--------------------------------------------------------------------------------
+- Modelo de execucao: cada interacao dispara reexecucao do script Python no
+  servidor, com custo proporcional ao tamanho de `app.py` e dependencias.
+- UI: personalizacao possivel (CSS injetado, `ui/components.py`), mas continua
+  dentro do motor de widgets Streamlit — menos flexivel que React para micro-
+  interacoes, animacoes, tabelas virtuais e padroes de SPA.
+- Navegacao: simulada por `radio` na sidebar, nao por URLs profundas (partilha de
+  ligacao para ecra especifico e SEO sao limitados).
+- Conexao a BD: padrao "long-lived por processo" em Python; em ambiente serverless
+  multi-instancia, o pooling deve ser centralizado (Supabase pooler) — ja ha
+  cuidado com `prepare_threshold=0`, mas a arquitetura Streamlit Cloud difere de
+  centenas de invocacoes curtas em paralelo.
+
+
+5. O QUE A VERCEL OFERECE (ALINHAMENTO COM OBJETIVOS)
+--------------------------------------------------------------------------------
+- CDN global, TLS, previews por PR, integracao Git.
+- Next.js (App Router): Server Components, Server Actions, streaming, otimizacao
+  de imagens, roteamento e layouts — adequado a "visual melhor" e UX rapida.
+- Vercel Functions / Fluid Compute: endpoints REST ou acoes de mutacao com limites
+  de tempo e memoria definidos (importante para operacoes pesadas hoje no Python).
+- Edge Middleware: autenticacao, redirecionamentos, cabecalhos de seguranca.
+
+Limitacao relevante: nao executar o monolito Streamlit "como esta" na Vercel.
+A migracao e de produto (reescrita da camada de apresentacao + orquestracao HTTP),
+nao de "lift-and-shift" do ficheiro `app.py`.
+
+
+6. OPCOES DE ARQUITETURA ALVO (PARA O ENGENHEIRO DECIDIR)
+--------------------------------------------------------------------------------
+
+OPCAO A — Next.js full-stack na Vercel (recomendada para alinhamento com a plataforma)
+- Frontend: React/Next.js, Tailwind, design system (ex.: shadcn/ui).
+- Dados: Server Components + consultas com cliente Postgres server-side
+  (@vercel/postgres ou `postgres` com pooling) OU Supabase client (RLS) com
+  politicas bem definidas.
+- Logica de negocio hoje em Python:
+  * Reescrever gradualmente em TypeScript nas camadas de servico, OU
+  * Expor API REST interna (Python em Railway/Fly.io/AWS) consumida pelo Next.js,
+    mantendo `services/*` como fonte de verdade por fase de transicao.
+
+OPCAO B — Next.js na Vercel + API Python separada
+- UI e autenticacao de sessao na Vercel.
+- Microservico FastAPI (ou similar) com a logica atual extraida de handlers finos;
+  comunicacao via HTTPS + contratos OpenAPI.
+- Vantagem: reutilizacao maxima de Python; Desvantagem: dois deploys, latencia
+  extra, duplicacao de modelos de auth se nao for bem desenhado.
+
+OPCAO C — Manter Streamlit para admin interno + novo portal "cliente" na Vercel
+- Se o prazo for critico: fase hibrida com novo front apenas para fluxos de maior
+  valor ou leitura; deprecar Streamlit ao longo do tempo.
+
+
+7. MAPEAMENTO DE CAPACIDADES (STREAMLIT -> VERCEL/NEXT)
+--------------------------------------------------------------------------------
+| Capacidade atual              | Streamlit hoje              | Alvo tipico Vercel        |
+|-------------------------------|-----------------------------|---------------------------|
+| Navegacao por modulos         | sidebar.radio               | App Router `/painel`, etc.|
+| Formularios e mutacoes        | botoes + servicos Python    | Server Actions / POST API |
+| Tabelas e filtros             | pandas/st.dataframe         | TanStack Table / ag-grid  |
+| Graficos                      | Plotly                      | Plotly.js, Recharts, ECharts |
+| Cache de consultas BI         | st.cache_data               | unstable_cache / fetch + tags |
+| Segredos                      | st.secrets / .env           | Vercel Environment Variables |
+| Login                         | session_state + BD          | NextAuth / Clerk / Supabase Auth |
+| Upload imagens produto        | file_uploader               | Blob + URL assinada       |
+| RBAC / tenant                 | utils em runtime Python     | middleware + claims JWT / RLS |
+
+
+8. RISCOS E PONTOS DE ATENCAO
+--------------------------------------------------------------------------------
+8.1 Conexoes PostgreSQL em serverless
+- Cada invocacao pode abrir conexao; usar pooler (Supabase porta 6543 transaction
+  mode) e drivers que desativam prepared statements partilhados (no Node, usar
+  pooler-compatible settings equivalentes ao `prepare_threshold=0` do psycopg).
+
+8.2 Transacoes longas e locks
+- Operacoes de venda/estoque que hoje correm num unico processo Streamlit devem
+  ser transacionais no backend; timeouts de funcao Vercel podem exigir filas
+  (Vercel Queue, Inngest, ou trigger Supabase) para tarefas longas.
+
+8.3 Seguranca
+- Nunca expor `DATABASE_URL` com privilegios elevados ao browser; apenas ao
+  servidor. Preferir RLS no Supabase + anon key no cliente se o modelo for
+  "data layer no Supabase".
+- Rever `ensure_authenticated_or_stop` e equivalente web (cookies httpOnly,
+  CSRF em formularios se usar cookies de sessao).
+
+8.4 Paridade funcional
+- O ficheiro `app.py` e grande: risco de regressao. Sugestao: inventario de
+  fluxos criticos (registar venda, baixa de estoque, precificacao) com testes de
+  aceitacao antes de desligar Streamlit.
+
+8.5 Debug em producao
+- Em `main()` existe bloco "DB Connection Debug" (`test_db_connection`) visivel
+  no arranque — em qualquer migracao, garantir que dados de debug nao aparecem
+  em producao publica.
+
+
+9. FASES SUGERIDAS DE PROJETO (PARA PLANO DETALHADO DO ENGENHEIRO)
+--------------------------------------------------------------------------------
+Fase 0 — Descoberta e baseline
+- Listar todos os fluxos de usuario por modulo (Painel ... UAT).
+- Medir: tempo de primeiro byte percebido, tempo de rerun em Streamlit (laboratorio).
+- Congelar contrato de dados: esquema Postgres atual (migrations em `database/`).
+
+Fase 1 — Fundacao na Vercel
+- Monorepo ou repo novo com Next.js; CI; variaveis de ambiente; ambiente preview.
+- Autenticacao escolhida + modelo de sessao alinhado a multi-tenant.
+
+Fase 2 — Leitura primeiro (read-only)
+- Portar Painel e listagens somente leitura com os mesmos SQL/agregados de
+  `services/read_queries.py` (via API ou queries server-side).
+
+Fase 3 — Mutacoes criticas
+- Vendas, estoque, clientes: uma a uma, com testes e rollback.
+
+Fase 4 — Uploads e ativos
+- Migrar `file_uploader` para fluxo assinado para storage.
+
+Fase 5 — Desativacao Streamlit
+- Redirect, export de dados, formacao de utilizadores, monitorizacao.
+
+
+10. ENTREGAVEIS QUE O PLANO DO ENGENHEIRO DEVE INCLUIR
+--------------------------------------------------------------------------------
+- Diagrama C4 (contexto, contentores, componentes) do alvo.
+- Matriz de tracabilidade: cada `PAGE_*` -> rotas Next + APIs.
+- Estrategia de dados: ORM vs SQL bruto vs Supabase client.
+- Plano de testes: unitarios, integracao, e2e (Playwright).
+- Plano de secrets e rotacao de credenciais.
+- SLAs internos: latencia alvo, limites de payload, politica de retries.
+- Runbook de deploy e rollback na Vercel.
+
+
+11. REFERENCIAS INTERNAS (FICHEIROS CHAVE NO REPOSITORIO)
+--------------------------------------------------------------------------------
+- `app.py` — aplicacao principal Streamlit.
+- `streamlit_app/app.py` — dashboard Postgres leve.
+- `utils/app_auth.py` — autenticacao e sessao.
+- `database/connection.py` — Postgres / pooler / cache de conexao.
+- `database/config.py` — DSN e ambiente.
+- `services/*.py` — logica de aplicacao.
+- `utils/painel_dashboard.py` — painel BI.
+- `ui/components.py` — componentes visuais BI (contexto Streamlit).
+- `requirements.txt` — dependencias Python.
+- `.streamlit/secrets.toml.example` (se existir na raiz ou em `streamlit_app/`) —
+  documentar mapeamento para Vercel env.
+
+
+12. CONCLUSAO
+--------------------------------------------------------------------------------
+A migracao para Vercel e, na pratica, a construcao de uma nova camada web
+(moderna e performatica) que consome a mesma base de negocio (PostgreSQL /
+Supabase) e rehospeda a experiencia hoje implementada em Streamlit. O codigo
+Python existente em `services/` e `database/` e um ativo para reutilizacao via
+API ou para guiar a reimplementacao em TypeScript. O presente documento fornece
+o contexto minimo para o engenheiro estimar esforco, ordenar entregas e mitigar
+riscos de conectividade, autenticacao e uploads.
+
+================================================================================
+FIM DO RELATORIO
+================================================================================

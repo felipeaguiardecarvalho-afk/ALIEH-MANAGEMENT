@@ -1,0 +1,388 @@
+================================================================================
+RELATORIO TECNICO COMPLETO — SISTEMA ATUAL EM STREAMLIT (ALIEH MANAGEMENT)
+================================================================================
+Data de elaboracao: 2026-05-03
+Repositorio: ALIEH management (workspace local)
+Publico-alvo: Engenheiro de software (baseline funcional para comparar com o
+              prototipo Next.js e planejar migracao apenas da UI)
+Deploy publico de referencia (URL informada pelo utilizador):
+  https://aliehmanagement.streamlit.app/
+  (Nota: este relatorio baseia-se no codigo-fonte local; o comportamento em
+   producao deve ser validado contra essa instancia quando necessario.)
+================================================================================
+
+1. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+A aplicacao de gestao comercial atual e um monolito Python executado pelo
+framework Streamlit. O ficheiro principal `app.py` (milhares de linhas)
+concentra: autenticacao, navegacao lateral, e toda a interface dos modulos
+(Painel, Produtos, Custos, Precificacao, Estoque, Clientes, Vendas, Checklist
+UAT). A persistencia e PostgreSQL (tipicamente Supabase em producao), com uma
+camada de servicos em `services/*` e repositorios / queries em `database/*`.
+
+Caracteristicas distintivas do modelo Streamlit relevantes para migracao:
+- Cada interaccao do utilizador pode reexecutar o script inteiro (custo de CPU
+  proporcional ao tamanho de `app.py` e imports).
+- Navegacao e simulada por `st.sidebar.radio` (nao sao URLs profundas por modulo
+  no sentido de SPA; embora o Streamlit suporte multipagina, este projecto
+  usa padrao monopagina com ramificacao por `page == …`).
+- Autenticacao, tenant e RBAC vivem em `utils/app_auth.py` e `utils/rbac.py`,
+  com throttling de login e auditoria.
+- Cache de dados agregados no Painel via `st.cache_data` (TTL 120s / 300s em
+  varias funcoes em `utils/painel_dashboard.py`).
+
+================================================================================
+
+2. ARQUITECTURA DE ALTO NIVEL
+--------------------------------------------------------------------------------
+2.1 Entrada e runtime
+- Ficheiro: `app.py`
+- Framework: `streamlit`
+- Dados tabulares: `pandas`
+- Graficos BI: `plotly` (no Painel executivo)
+- SQL: `psycopg` (via `database/connection.py`, `prepare_threshold=0` para
+  compatibilidade com PgBouncer / Supabase pooler)
+
+2.2 Camada de negocio (nao deve ser alterada na migracao de UI pura)
+- `services/product_service.py` — cadastro de produto, precificacao, custos,
+  recebimento de stock, baixa manual, reset de lote, etc.
+- `services/product_lot_facade.py` — edicao de lote, fotos, bloqueios, exclusao
+  de SKU do catalogo, razoes de bloqueio.
+- `services/customer_service.py` — CRUD de clientes.
+- `services/sales_service.py` — `record_sale` (transaccao atomica com stock).
+- `services/read_queries.py` — camada de leitura com `st.cache_data` de curto
+  TTL (10s) sobre funcoes de `database.repositories.query_repository`.
+- `services/uat_checklist_service.py` — reexporta casos e funcoes UAT.
+- `services/tenant_scope.py` — `effective_tenant_id_for_request` (multi-tenant).
+
+2.3 Persistencia e schema
+- `database/connection.py`, `database/config.py` — DSN, ambiente, flags.
+- `database/repositories/query_repository.py` — implementacao real das queries
+  de leitura (produtos, vendas, KPIs, etc.).
+- `schema.sql` na raiz — referencia de schema PostgreSQL alinhado ao motor.
+
+================================================================================
+
+3. ARRANQUE DA APLICACAO (`main()` em `app.py`)
+--------------------------------------------------------------------------------
+Fluxo tipico ao iniciar (ordem aproximada — ver codigo para detalhe exacto):
+- Bloco de debug de ligacao a BD (`test_db_connection`, visivel como subheader;
+  ATENCAO: em migracao web publica, garantir que debug nao aparece em producao).
+- `services.db_startup.run_database_init()` — inicializacao/migracao conforme
+  politica do projecto.
+- Rotinas de backup / manutencao periodica (`utils.audit_backup`, etc.).
+- `ensure_authenticated_or_stop()` — se autenticacao estiver configurada em
+  producao, bloqueia a app ate login valido.
+- Injecao de CSS (ex.: fonte Montserrat via Google Fonts no historico do
+  projecto).
+- Renderizacao da navegacao lateral e despacho por modulo (`page`).
+
+================================================================================
+
+4. AUTENTICACAO, RBAC E MULTI-TENANT
+--------------------------------------------------------------------------------
+4.1 Autenticacao (`utils/app_auth.py`)
+- Modos:
+  (a) **Modo BD prioritario:** se existir pelo menos um registo na tabela
+      `users`, apenas esse modo valida passwords (hash em `password_hash`).
+  (b) **Modo legacy:** se `users` estiver vazia, credenciais em env/Secrets
+      (`ALIEH_AUTH_USERNAME`, `ALIEH_AUTH_PASSWORD`, etc.).
+  (c) **Desenvolvimento:** sem nenhum modo configurado, a app abre sem login.
+- Producao / Streamlit Cloud: `is_production_environment()` pode forcar que
+  exista autenticacao (legacy ou utilizadores na BD).
+- Sessao Streamlit: chaves `alieh_auth_ok`, `alieh_auth_username`,
+  `alieh_auth_user_id`, `alieh_auth_role`, `alieh_tenant_id`, contadores de
+  falhas e lockout por utilizador.
+- Throttling: `database/login_throttle_repo.py` — lockout apos falhas,
+  `LOCKOUT_SECONDS`, `MAX_FAILURES_BEFORE_LOCKOUT`, auditoria em
+  `login_attempt_audit` quando aplicavel.
+
+4.2 RBAC (`utils/rbac.py`)
+- `ROLE_ADMIN` / `ROLE_OPERATOR`.
+- `require_admin()` — usado em operacoes de catalogo, custos gravados,
+  precificacao, exclusoes irrevogaveis, entrada de stock (conforme docstring).
+- `require_operator_or_admin()` — vendas e cadastro operacional de clientes.
+- `is_admin()` / `is_operator_or_admin()` — helpers para condicionar UI;
+  quando auth nao esta configurada, `is_admin()` devolve True (fluxo aberto).
+
+4.3 Multi-tenant
+- `database/tenancy.py` — `DEFAULT_TENANT_ID`, `resolve_tenant_id`.
+- `services/tenant_scope.effective_tenant_id_for_request()` — todas as queries
+  de leitura/escrita relevantes filtram por `tenant_id`.
+
+IMPLICATION PARA MIGRACAO WEB:
+- O prototipo Next.js deve replicar: login, sessao, tenant na cookie ou JWT,
+  e as mesmas chamadas `require_admin` / `require_operator_or_admin` em cada
+  rota/accao, ou delegar a RLS no Supabase com policies equivalentes.
+
+================================================================================
+
+5. NAVEGACAO LATERAL (ORDEM EXACTA)
+--------------------------------------------------------------------------------
+Constantes de rotulo (linhas ~153-160 de `app.py`):
+- PAGE_PRODUTOS = "Produtos"
+- PAGE_ESTOQUE = "Estoque"
+- PAGE_CUSTOS = "Custos"
+- PAGE_PRECIFICACAO = "Precificacao"
+- PAGE_VENDAS = "Vendas"
+- PAGE_CLIENTES = "Clientes"
+- PAGE_PAINEL = "Painel"
+- PAGE_UAT = "Checklist UAT"
+
+`st.sidebar.radio("Navegacao", [ ... ], index=0)` — ordem apresentada ao user:
+1. Painel
+2. Produtos
+3. Custos
+4. Precificacao
+5. Estoque
+6. Clientes
+7. Vendas
+8. Checklist UAT
+
+Extras na sidebar:
+- Botao **Sair** quando auth configurada (`logout()` + `st.rerun()`).
+- Caption com inquilino: ``Inquilino: `{get_session_tenant_id()}```.
+- `_maybe_sidebar_database_export()` — expander de backup SQLite (apenas
+  ambiente SQLite + permissoes admin); le ficheiro via `services.sqlite_admin`.
+
+================================================================================
+
+6. MODULO — PAINEL EXECUTIVO
+--------------------------------------------------------------------------------
+Implementacao principal: `utils/painel_dashboard.py` (funcao
+`render_painel_executivo` chamada desde `app.py` quando `page == PAGE_PAINEL`).
+
+6.1 Leituras e cache
+- `st.cache_data(ttl=120)` / `ttl=300` em agregacoes pesadas.
+- Servicos / queries tipicos:
+  - `services.read_queries.fetch_sales_date_bounds`
+  - `services.read_queries.fetch_products` — dropdown de produto BI
+  - `services.read_queries.fetch_sku_master_rows` — dropdown SKU
+  - `services.read_queries.fetch_customers_ordered` — dropdown cliente + mapa
+  - `fetch_dashboard_kpis_period` — KPIs do periodo (current + janela anterior
+    para deltas)
+  - `fetch_daily_revenue_profit` — serie diaria
+  - `fetch_top_skus_by_metric` — top SKUs por receita
+  - `analytics.metrics.get_margin_per_sku` — margem % por SKU
+  - `analytics.metrics.get_stock_turnover` — rotacao proxy
+  - `analytics.metrics.get_cohort_summary` — coorte
+  - `analytics.metrics.get_stock_aging` — inventario parado (slider dias)
+  - `fetch_low_stock_products_dashboard` — alertas stock baixo
+  - `fetch_inventory_stock_summary` — resumo inventario + metrica CMP
+  - `fetch_payment_method_breakdown` — pizza formas de pagamento
+  - `fetch_top_customers_by_revenue` — top clientes
+
+6.2 Widgets de filtro (chaves de sessao exemplificativas)
+- `bi_preset` — periodo: Personalizado / 7 / 30 / 90 dias
+- `bi_active_days` — **presente na UI mas sem ligacao directa as queries do
+  ficheiro** (lacuna documentada no inventario interno)
+- `bi_product`, `bi_sku`, `bi_customer`
+- `bi_d0`, `bi_d1` — datas se periodo personalizado
+- `bi_aging_days` — slider para stock aging
+
+6.3 Visualizacao
+- `st.metric` para KPIs
+- Graficos Plotly: barras horizontais, linhas com media movel MM7, pizza, etc.
+
+================================================================================
+
+7. MODULO — PRODUTOS
+--------------------------------------------------------------------------------
+7.1 Busca por SKU e lote (`st.expander` "Busca por SKU e lote")
+- `services.read_queries.fetch_product_search_attribute_options()` — listas
+  distintas para filtros.
+- `services.read_queries.search_products_filtered(text_q, frame, lens, gender,
+  palette, style, sort_by, limit, offset, tenant_id)` — devolve rows + total.
+- Widgets:
+  - `sku_search_text_q` — texto
+  - `sku_search_sort` — sku | name | stock_desc | stock_asc
+  - `sku_search_ps` — 25/50/100/200 linhas por pagina
+  - Filtros: cor armação, cor lente, genero, paleta, estilo (`FILTER_ANY` +
+    valores distintos)
+  - `sku_search_page` — numero de pagina
+  - `sku_search_product_focus` — selector de produto para painel de detalhe
+
+7.2 Detalhe do produto seleccionado
+- `fetch_product_by_id`, imagem via `product_image_abs_path`, bloqueios de
+  edicao (`product_lot_edit_block_reason`, `sku_correction_block_reason`).
+
+7.3 Cadastro de produto
+- `require_admin()` em operacoes de escrita.
+- Campos: nome, data de registro, atributos (dropdowns com "outro" via
+  `dropdown_with_other` / `attribute_selectbox`), foto opcional
+  (`st.file_uploader`).
+- Accao: `services.product_service.add_product(...)` (+ bytes de imagem se
+  houver).
+
+7.4 Edicao de lote
+- `st.form` por id do produto: nome, data, atributos.
+- Accao: `services.product_lot_facade.update_product_lot_attributes(...)`.
+- Foto: `update_product_lot_photo`.
+
+7.5 Exclusao de SKU do catalogo
+- Fluxo com confirmacao; `hard_delete_sku_catalog` quando nao bloqueado.
+
+CONSTANTES DE LISTAS (cadastro) — ver `app.py`:
+- `PRODUCT_GENDER_OPTIONS`, `PRODUCT_PALETTE_OPTIONS`, `PRODUCT_STYLE_OPTIONS`,
+  `PRODUCT_FRAME_COLOR_OPTIONS`, `PRODUCT_LENS_COLOR_OPTIONS` (listas longas).
+
+================================================================================
+
+8. MODULO — CUSTOS
+--------------------------------------------------------------------------------
+8.1 Leituras
+- `fetch_sku_master_rows`, `fetch_product_triple_label_by_sku`
+- `SKU_COST_COMPONENT_DEFINITIONS` (via `services.domain_constants` →
+  `database.constants`)
+- `fetch_sku_cost_components_for_sku`
+- `fetch_product_batches_for_sku`, `get_persisted_structured_unit_cost`
+- Historico: `fetch_recent_stock_cost_entries`
+
+8.2 Escrita — composicao de custo
+- Botao "Salvar composicao de custo" → `save_sku_cost_structure`
+- Inputs: quantidade + preco unitario por componente; validadores em
+  `utils.validators`.
+
+8.3 Escrita — entrada de stock (recebimento)
+- `add_stock_receipt(sku, product_id, quantity, unit_cost)` com checkbox de
+  confirmacao explicita.
+- Efeito: custo medio ponderado (CMP) e movimentos auditaveis via repos Python.
+
+================================================================================
+
+9. MODULO — PRECIFICACAO
+--------------------------------------------------------------------------------
+- Gating: `require_admin()` no inicio da seccao (~linha 1975 em `app.py`).
+- Leituras: `fetch_sku_master_rows`, `fetch_product_triple_label_by_sku`,
+  `fetch_active_sku_pricing_record`, `fetch_sku_pricing_records_for_sku`,
+  `fetch_price_history_for_sku`.
+- Calculo live: `compute_sku_pricing_targets` (percentual vs absoluto — radios
+  `PRICING_MODE_PCT` / `PRICING_MODE_ABS` por dimensao: markup, taxas, juros).
+- Escrita: `save_sku_pricing_workflow` — registo append-only, desactiva
+  anteriores, activa novo, propaga preco para `sku_master` e `products`.
+
+================================================================================
+
+10. MODULO — ESTOQUE
+--------------------------------------------------------------------------------
+- Gating: `require_admin()`.
+- Leitura: `fetch_products` filtrada na UI para lotes com stock > 0; grid
+  `st.dataframe` com multiselects de filtro por coluna e ordenacao.
+- Escrita — baixa manual:
+  - `apply_manual_stock_write_down(product_id, quantity, user_id=..., tenant_id=...)`
+  - Checkbox de confirmacao por nonce.
+- Escrita — exclusao de lote:
+  - Dialogo `@st.dialog` com `reset_batch_pricing_and_exclude(enter_code)`.
+
+================================================================================
+
+11. MODULO — CLIENTES
+--------------------------------------------------------------------------------
+- Leitura: `fetch_customers_ordered`.
+- Integracao ViaCEP: funcao local em `app.py` (`fetch_viacep_address`) — HTTPS
+  `viacep.com.br` (nao e modulo `services/`).
+- Cadastro: `insert_customer_row` dentro de `st.form` com campos completos
+  (nome obrigatorio, endereco, etc.) — `require_operator_or_admin()`.
+- Edicao: formulario por cliente seleccionado — `update_customer_row`.
+- Exclusao: `delete_customer_row` — `require_admin()` + confirmacao.
+
+================================================================================
+
+12. MODULO — VENDAS
+--------------------------------------------------------------------------------
+- Leituras:
+  - `fetch_skus_available_for_sale`
+  - `fetch_customers_ordered` + filtro de busca (`filter_customers_by_search`)
+  - `fetch_product_batches_in_stock_for_sku`
+  - `fetch_recent_sales_for_ui`
+- Escrita: `record_sale` — `require_operator_or_admin()`
+- Passos de UI (chaves de widget):
+  1. Escolher SKU (`sales_step1_sku_label`)
+  2. Se multiplos lotes: selector de lote
+  3. Busca + select de cliente
+  4. Quantidade (`sales_qty_{product_id}`)
+  5. Desconto: modo percentual vs valor fixo + inputs
+  6. Forma de pagamento (`SALE_PAYMENT_OPTIONS` em `database.constants`)
+  7. Checkbox de confirmacao + botao "Concluir venda"
+
+Efeitos em BD (via servico): decremento atomico de stock, sync `sku_master`,
+`INSERT INTO sales`, alocacao de `sale_code`.
+
+================================================================================
+
+13. MODULO — CHECKLIST UAT
+--------------------------------------------------------------------------------
+- Funcao: `_render_uat_manual_checklist_page` em `app.py`.
+- Dados: `database.repositories.uat_checklist_repository`:
+  - `UAT_MANUAL_CASES` — lista de tuplos (codigo, titulo, descricao markdown)
+  - `UAT_STATUS_ORDER` — pending, pass, fail, blocked, na
+  - `fetch_map_for_tenant`, `upsert_uat_record`
+- UI: progress bar, dataframe resumo, expander por caso com selectbox de
+  resultado + text area de notas + botao "Gravar resultado".
+- Logging: `utils.critical_log.log_critical_event("UAT_MANUAL_CHECKLIST_SAVE", ...)`
+- RBAC: `require_operator_or_admin()`.
+
+================================================================================
+
+14. IMPORTS EM `app.py` POTENCIALMENTE NAO USADOS NA UI ACTUAL
+--------------------------------------------------------------------------------
+(Detectado por inventario estatico — validar com grep antes de remover codigo)
+- `peek_next_customer_code_preview`
+- Simbolos de `product_service`: `clear_batch_pricing_only`, `set_product_pricing`,
+  `set_product_pricing_for_batch`, `update_product_attributes`,
+  `update_sku_selling_price`
+Estes podem ser legado ou reservados; nao assumir ausencia de uso sem auditoria
+de branches condicionais.
+
+================================================================================
+
+15. OUTRAS APLICACOES STREAMLIT NO REPOSITORIO
+--------------------------------------------------------------------------------
+- `streamlit_app/app.py` — dashboard menor (metricas simples + grafico 30 dias);
+  usa `DATABASE_URL` em secrets.
+- `alieh_supabase/app/main.py` — utilitario / estado Supabase (URL + anon key).
+
+================================================================================
+
+16. LIMITACOES INERENTES AO MODELO STREAMLIT (RELEVANTES PARA MIGRACAO)
+--------------------------------------------------------------------------------
+- Reexecucao completa do script por interaccao (latencia e custo de servidor).
+- Navegacao sem URLs profundas por modulo (partilha de links para ecra exacto
+  limitada vs App Router).
+- Upload de ficheiros (`st.file_uploader`) — em Vercel/serverless exige storage
+  externo (Blob, Supabase Storage, S3).
+- Debug de BD visivel no arranque — risco operacional se exposto publicamente.
+
+================================================================================
+
+17. TABELAS PRINCIPAIS TOCADAS PELA UI (REFERENCIA RAPIDA)
+--------------------------------------------------------------------------------
+(Ver `schema.sql` para DDL completo e constraints)
+- `products` — lotes, stock, custo, preco, atributos, deleted_at
+- `sku_master` — agregado por SKU (total_stock, avg_unit_cost, selling_price, …)
+- `customers` — CRM
+- `sales` — linhas de venda (total, cogs_total, sold_at texto ISO-like, …)
+- `sku_cost_components` — linhas de custo estruturado
+- `stock_cost_entries` — auditoria de entradas de stock / CMP
+- `sku_pricing_records` — workflow de precificacao (is_active, kinds %/abs)
+- `price_history` — historico legado / notas
+- `uat_manual_checklist` — resultados UAT
+- `users`, `login_*` — autenticacao e auditoria de login
+- Contadores: `sku_sequence_counter`, `customer_sequence_counter`,
+  `sale_sequence_counter`
+
+================================================================================
+
+18. CHECKLIST DE VALIDACAO PARA O ENGENHEIRO (STREAMLIT vs PRODUCAO)
+--------------------------------------------------------------------------------
+[ ] Confirmar que `https://aliehmanagement.streamlit.app/` corresponde a esta
+    versao de `app.py` (commit/tag).
+[ ] Confirmar modo de autenticacao activo (BD vs legacy) e politica de tenant.
+[ ] Validar que todas as accoes de escrita exigidas pelo negocio passam pelos
+    mesmos servicos Python (fonte de verdade ate decisao de API).
+[ ] Mapear tempos de resposta percebidos (rerun) por modulo para baseline UX.
+[ ] Inventariar uploads (imagens produto) e limites de tamanho em Streamlit Cloud.
+
+================================================================================
+FIM DO RELATORIO — SISTEMA STREAMLIT ATUAL
+================================================================================

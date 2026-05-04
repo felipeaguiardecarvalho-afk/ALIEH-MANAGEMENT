@@ -1,0 +1,36 @@
+# Render Blueprint — api-prototype (FastAPI na raiz do monorepo).
+# Dashboard: New → Blueprint → ligue o repositório Git; o Render usa este ficheiro.
+# Depois do primeiro deploy, defina os secrets em Dashboard → Environment (ver docs/DEPLOYMENT_VERCEL_RENDER.md).
+
+services:
+  - type: web
+    name: alieh-api-prototype
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt -r api-prototype/requirements.txt
+    startCommand: cd api-prototype && export PYTHONPATH=.. && uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ALIEH_ENV
+        value: production
+      - key: NODE_ENV
+        value: production
+      - key: ALIEH_PROTOTYPE_OPEN
+        value: "0"
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_PRODUCT_IMAGES_BUCKET
+        sync: false
+      - key: PROTOTYPE_AUDIT_INGEST_SECRET
+        sync: false
+      - key: API_PROTOTYPE_INTERNAL_SECRET
+        sync: false
+      - key: API_PROTOTYPE_TRUSTED_ORIGINS
+        sync: false

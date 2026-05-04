@@ -96,6 +96,12 @@ def format_insufficient_stock(stock: float) -> str:
 MSG_SALE_DISCOUNT_EXCEEDS_BASE = (
     "O desconto não pode exceder o valor base (preço unitário × quantidade)."
 )
+MSG_SALE_PREVIEW_MISMATCH = (
+    "Estado alterado; actualize o resumo e tente novamente."
+)
+MSG_SALE_IDEMPOTENCY_PAYLOAD_MISMATCH = (
+    "Chave de idempotência já usada com outro pedido; use uma chave nova."
+)
 
 # --- Autenticação ---
 

@@ -1,0 +1,14 @@
+# Prototype API only — parent repo supplies database/services code.
+# Load same .env / DB as Streamlit when testing against real data.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+psycopg[binary]>=3.1.0
+streamlit>=1.29.0
+pandas>=2.0.0
+supabase>=2.6.0
+
+# Run from this directory (uses repo-root .env / DB via parent services):
+#   python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000

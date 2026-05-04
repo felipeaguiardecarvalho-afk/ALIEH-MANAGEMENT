@@ -237,6 +237,8 @@ CREATE TABLE IF NOT EXISTS sales (
 
 CREATE INDEX IF NOT EXISTS idx_sales_tenant_sold_at ON sales (tenant_id, sold_at);
 CREATE INDEX IF NOT EXISTS idx_sales_tenant_sku ON sales (tenant_id, sku);
+-- Recent sales list: ORDER BY id DESC per tenant (api-prototype / Streamlit).
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_id_desc ON sales (tenant_id, id DESC);
 
 -- ---------------------------------------------------------------------------
 -- Auditoria / UAT

@@ -1,4 +1,5 @@
 node_modules/
+.next/
 
 # Secrets and env (never commit real values)
 .env
@@ -20,3 +21,12 @@ __pycache__/
 audit_backups/
 product_images/
 .alieh_data/
+
+# Uploads servidos por Next.js (ficheiros binários)
+public/product-uploads/*
+!public/product-uploads/.gitkeep
+
+# Cópias de segurança locais / ferramentas (não versionar)
+*.zip
+.claude/
+.obsidian_export/

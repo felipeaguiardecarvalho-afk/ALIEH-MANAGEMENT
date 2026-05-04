@@ -1,6 +1,47 @@
 {
   "type": "module",
   "scripts": {
-    "test:customers": "node --env-file=.env scripts/testCreateCustomer.js"
+    "dev": "npm --prefix web-prototype run dev",
+    "dev:api": "cd api-prototype && python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000",
+    "dev:prototype": "npm --prefix web-prototype run dev",
+    "dev:root": "next dev -p 3001",
+    "build": "next build",
+    "build:prototype": "npm --prefix web-prototype run build",
+    "start": "next start",
+    "start:prototype": "npm --prefix web-prototype run start",
+    "lint": "next lint",
+    "lint:prototype": "npm --prefix web-prototype run lint",
+    "test:customers": "node --env-file=.env scripts/testCreateCustomer.js",
+    "test:api": "pytest tests/api -v --tb=short -m live_api",
+    "test:unit": "pytest tests -v --tb=short --ignore=tests/api",
+    "test:qa": "pytest tests -v --tb=short --ignore=tests/api && pytest tests/api -v --tb=short -m live_api",
+    "test:qa:full": "npm run test:qa && npm run test:e2e",
+    "test:qa:full:docker": "node scripts/qa/gate-runner.mjs",
+    "test:pg": "pytest tests/test_postgres_integration.py -v --tb=short",
+    "test:gate": "npm run test:unit && npm run test:api && npm run test:pg && npm run test:e2e",
+    "test:e2e": "npm --prefix tests/e2e run test",
+    "ci:seed-e2e": "python scripts/ci/seed_e2e_user.py"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.105.1",
+    "@tanstack/react-table": "latest",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
+    "lucide-react": "latest",
+    "next": "latest",
+    "postgres": "latest",
+    "radix-ui": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "server-only": "latest",
+    "tailwind-merge": "latest"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest"
   }
 }

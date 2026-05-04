@@ -1,0 +1,145 @@
+# Gate de prontidão: Supabase (DATABASE_URL) + api-prototype + Next + pytest + Playwright.
+# Configure o secret do repositório ALIEH_CI_DATABASE_URL (connection string Postgres do Supabase).
+# Não altera services/ — apenas valida integração e endurecimento de ambiente.
+
+name: production-readiness
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: production-readiness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AUTH_SESSION_SECRET: ci-local-session-secret-min-32-chars-long
+  API_PROTOTYPE_URL: http://127.0.0.1:8000
+  ALIEH_API_TEST_URL: http://127.0.0.1:8000
+  ALIEH_TENANT_ID: default
+  ALIEH_E2E_PASSWORD: E2E_ci_change_me_!
+  ALIEH_CI_E2E_PASSWORD: E2E_ci_change_me_!
+  ALIEH_E2E_USERNAME: e2e_ci
+  ALIEH_CI_E2E_USERNAME: e2e_ci
+  ALIEH_PROTOTYPE_OPEN: "0"
+  CI: "true"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.ALIEH_CI_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require Supabase DATABASE_URL (secret)
+        run: |
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "::error::Defina o secret do repositório ALIEH_CI_DATABASE_URL (Postgres do Supabase: Project Settings → Database)."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web-prototype/package-lock.json
+
+      - name: Install PostgreSQL client (psql → Supabase)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+      - name: Apply schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema.sql
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt -r api-prototype/requirements.txt
+
+      - name: Seed E2E user
+        run: python scripts/ci/seed_e2e_user.py
+
+      - name: Start API (background)
+        run: |
+          cd api-prototype
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/api.log 2>&1 &
+          echo $! > /tmp/api.pid
+          for i in $(seq 1 45); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null; then
+              echo "API healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "--- api log ---"
+          cat /tmp/api.log || true
+          exit 1
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          ALIEH_PROTOTYPE_OPEN: "0"
+
+      - name: Unit tests (inclui integração Postgres no mesmo run)
+        run: pytest tests -v --tb=short --ignore=tests/api
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          ALIEH_PG_INTEGRATION: "1"
+
+      - name: API live tests
+        run: pytest tests/api -v --tb=short -m live_api
+
+      - name: Install web-prototype dependencies
+        run: npm ci
+        working-directory: web-prototype
+
+      - name: Build web-prototype
+        run: npm run build
+        working-directory: web-prototype
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          AUTH_SESSION_SECRET: ${{ env.AUTH_SESSION_SECRET }}
+          API_PROTOTYPE_URL: ${{ env.API_PROTOTYPE_URL }}
+          ALIEH_TENANT_ID: ${{ env.ALIEH_TENANT_ID }}
+          ALIEH_PROTOTYPE_OPEN: ${{ env.ALIEH_PROTOTYPE_OPEN }}
+
+      - name: Start Next.js (background)
+        run: |
+          cd web-prototype
+          nohup npm run start > /tmp/next.log 2>&1 &
+          echo $! > /tmp/next.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:3000/login > /dev/null; then
+              echo "Next ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "--- next log ---"
+          cat /tmp/next.log || true
+          exit 1
+        env:
+          PORT: "3000"
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          AUTH_SESSION_SECRET: ${{ env.AUTH_SESSION_SECRET }}
+          API_PROTOTYPE_URL: ${{ env.API_PROTOTYPE_URL }}
+          ALIEH_TENANT_ID: ${{ env.ALIEH_TENANT_ID }}
+          ALIEH_PROTOTYPE_OPEN: ${{ env.ALIEH_PROTOTYPE_OPEN }}
+
+      - name: Install Playwright
+        run: npm ci && npx playwright install chromium
+        working-directory: tests/e2e
+
+      - name: E2E tests
+        run: npm test
+        working-directory: tests/e2e
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
+          ALIEH_E2E_PASSWORD: ${{ env.ALIEH_E2E_PASSWORD }}
+          ALIEH_E2E_USERNAME: ${{ env.ALIEH_E2E_USERNAME }}
+          ALIEH_STRICT_E2E: "1"

@@ -1,0 +1,54 @@
+# QA gate (perfil `gate`) — só **API** e **Next** em Docker; Postgres = Supabase via `DATABASE_URL` no anfitrião.
+# Schema + seed: `scripts/qa/gate-runner.mjs` corre no host (`python -m database.schema_apply`, `seed_e2e_user.py`).
+#
+# Variáveis esperadas no `docker compose` (exportadas pelo gate-runner):
+#   DATABASE_URL, AUTH_SESSION_SECRET
+# Opcional no host: ALIEH_ALLOW_NON_SUPABASE_DB=1 (gate-runner).
+
+services:
+  qa-api:
+    profiles: ["gate"]
+    image: python:3.11-slim
+    working_dir: /app/api-prototype
+    volumes:
+      - .:/app
+    ports:
+      - "127.0.0.1:36101:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ALIEH_PROTOTYPE_OPEN: "0"
+      ALIEH_ENV: staging
+    command: >
+      sh -c "pip install --no-cache-dir -q -r /app/requirements.txt -r /app/api-prototype/requirements.txt &&
+             cd /app/api-prototype && exec python -m uvicorn main:app --host 0.0.0.0 --port 8000"
+
+  qa-web:
+    profiles: ["gate"]
+    image: node:20-bookworm-slim
+    working_dir: /app/web-prototype
+    volumes:
+      - .:/app
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      qa-api:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      AUTH_SESSION_SECRET: ${AUTH_SESSION_SECRET}
+      PORT: "3000"
+      API_PROTOTYPE_URL: http://qa-api:8000
+      ALIEH_API_TEST_URL: http://qa-api:8000
+      ALIEH_TENANT_ID: default
+      ALIEH_PROTOTYPE_OPEN: "0"
+      ALIEH_ENV: staging
+      ALIEH_STRICT_QA_ENV: "1"
+      ALIEH_E2E_USERNAME: e2e_ci
+      ALIEH_E2E_PASSWORD: E2E_ci_change_me_!
+      NODE_ENV: production
+    command: >
+      bash -c "set -euo pipefail &&
+        cd /app/web-prototype &&
+        npm ci &&
+        npm run build &&
+        exec npm run start -- -H 0.0.0.0 -p 3000"

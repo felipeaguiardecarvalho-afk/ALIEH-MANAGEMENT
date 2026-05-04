@@ -1,0 +1,7 @@
+.next/
+node_modules/
+.env.local
+playwright-report/
+test-results/
+blob-report/
+.vercel

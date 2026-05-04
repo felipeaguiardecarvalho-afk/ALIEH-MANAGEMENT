@@ -1,0 +1,222 @@
+================================================================================
+RELATÓRIO TÉCNICO — ESTADO ATUAL DO PROTÓTIPO NEXT.JS (UI / MIGRAÇÃO)
+================================================================================
+Documento: RELATORIO_PROTOTIPO_NEXTJS_UI_MIGRACAO
+Data de atualização: 2026-05-02
+Repositório: ALIEH management
+Destinatário: Engenheiro de software (avaliação de arquitetura, paridade com
+              Streamlit e planeamento de evolução)
+================================================================================
+
+1. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+A camada web de protótipo está dividida em dois pacotes isolados no mesmo
+repositório, sem alteração ao Streamlit de produção nem aos serviços Python
+legados como ponto de entrada:
+
+  • /web-prototype   — Next.js (App Router), TypeScript, Tailwind, UI estilo
+                       shadcn, Server Components / Server Actions.
+  • /api-prototype   — FastAPI que importa `services/*` e `database/*` existentes
+                       (mesma lógica de negócio que a app Streamlit).
+
+Regra de isolamento: código novo de protótipo restringe-se a essas pastas;
+objetivo é replicar comportamento, não substituir produção ainda.
+
+Fluxo predominante de escrita: Next.js (Server Actions) → HTTP com cabeçalhos
+de contexto (inquilino, utilizador, perfil) → api-prototype → serviços /
+repositórios Python já existentes.
+
+Leituras: parte das páginas já consome apenas a API de protótipo; outras ainda
+usam `lib/queries.ts` (SQL server-side no Next via `postgres`) para listagens
+legadas ou rotas auxiliares — ver secção 5 (matriz híbrida).
+
+Autenticação no protótipo: login com JWT em cookie httpOnly (`AUTH_SESSION_SECRET`),
+tabela `users` em PostgreSQL (ou credencial legacy em desenvolvimento), perfis
+`admin` / `operator` / `viewer`, tenant via `ALIEH_TENANT_ID` e JWT. Middleware
+protege rotas (exc. modo aberto `ALIEH_PROTOTYPE_OPEN=1`).
+
+================================================================================
+
+2. STACK E FERRAMENTAS
+--------------------------------------------------------------------------------
+• Next.js (App Router), React, TypeScript strict, Tailwind CSS v4
+• `@tanstack/react-table` — catálogo de produtos
+• `postgres` — leituras diretas onde `lib/queries.ts` ainda é usado
+• `jose` — sessão JWT
+• FastAPI + uvicorn — api-prototype
+• Dependências adicionais no web-prototype: `@supabase/supabase-js` (upload de
+  imagem direto para Storage após URL assinada pela API)
+
+Ficheiros de referência: `web-prototype/package.json`, `api-prototype/requirements.txt`,
+`web-prototype/next.config.*`, `.env.example` (raiz do repo).
+
+================================================================================
+
+3. API DE PROTÓTIPO (`/api-prototype`)
+--------------------------------------------------------------------------------
+Prefixos REST (todos com contexto `X-Tenant-Id`, `X-User-Id`, `X-Role`; opcional
+`X-Username` para trilho de auditoria / UAT):
+
+  GET/POST …        /health
+  …                 /sales/record, /sales/product-context/{id}, /sales/recent
+  …                 /dashboard/filters, /dashboard/panel
+  …                 /products, /products/{id}, atributos, SKU, custos, imagem
+                    pública (URL Supabase validada), etc.
+  …                 /customers, /customers/{id}
+  …                 /inventory/lots, write-down, stock-receipt, batches/exclude
+  …                 /pricing/* (sku-master, snapshot, workflow, histórico, …)
+  …                 /uat/records (leitura; permite viewer), /uat/upsert (mutação)
+  …                 /storage/signed-upload (mint de URL; sem bytes de ficheiro
+                    na API)
+  …                 /audit/events, /audit/login-ingest (trilho de atividade)
+
+Autenticação na API: perfis `admin` e `operator` na maioria dos endpoints;
+`get_actor_read` permite `viewer` apenas onde necessário (ex.: GET /uat/records).
+
+Persistência de auditoria de protótipo: tabela `prototype_audit_events` criada
+com `CREATE TABLE IF NOT EXISTS` no arranque da API (eventos de vendas,
+precificação, stock, login/logout conforme implementação atual — ver código).
+
+================================================================================
+
+4. NEXT.JS — MAPA DE ROTAS E ORIGEM DOS DADOS
+--------------------------------------------------------------------------------
+Rota                    Dados principais (origem)
+----------------------  --------------------------------------------------------
+/ (redirect)            → /dashboard
+/login                  Server Action `login` (BD users / legacy)
+/dashboard            API: painel com filtros (data, SKU, produto, cliente),
+                        KPIs, gráficos e breakdowns; `revalidate = 120` + Suspense
+/products               API (`products-api`): lista filtrada, paginação, painel
+                        de detalhe de lote (URL)
+/products/new           API: criação de produto; upload de imagem via Supabase
+                        (URL assinada pela API, ficheiro não passa pelo servidor
+                        Next)
+/costs                  Híbrido: leituras `getProducts` + `getSkuMasterRows`
+                        (queries.ts); escrita API (`cost-structure`)
+/pricing                API (`pricing-api` + actions)
+/inventory              API (`inventory-api`); escrita API (baixa, entrada,
+                        exclusão de lotes)
+/customers              API (`customers-api`); escrita API
+/sales                  Leitura: `getRecentSales` (queries.ts)
+/sales/new              Leitura: `getCustomers`, `getSaleableSkus` (queries.ts);
+                        escrita e contexto de venda: API
+/uat                    API apenas (`uat-api`): GET /uat/records; POST /uat/upsert
+                        com utilizador e perfil reais (cabeçalhos)
+
+Rota interna:
+  /api/batches          GET por SKU — ainda usa `getBatchesForSku` (queries.ts)
+                        para o assistente de vendas
+
+================================================================================
+
+5. SERVER ACTIONS (escritas) — RESUMO
+--------------------------------------------------------------------------------
+Todas as mutações abaixo delegam em `apiPrototypeFetch` para a api-prototype
+(exceto onde indicado):
+
+  customers.ts     POST/PATCH/DELETE /customers
+  products.ts      POST /products, PUT atributos, DELETE SKU, reset de lote
+  costs.ts         POST custos por SKU
+  pricing.ts       POST workflow de precificação (+ leituras auxiliares na API)
+  inventory.ts     write-down, stock-receipt, exclusão de lotes
+  sales.ts         contexto de produto + registo de venda
+  uat.ts           POST /uat/upsert
+  auth.ts          sessão JWT; ingestão opcional de auditoria de login
+  product-image-upload.ts  POST /storage/signed-upload (metadados apenas)
+
+Gates: `gateMutation()` / `requireAdmin()` / `requireOperator()` conforme rota.
+
+================================================================================
+
+6. FUNCIONALIDADES RECENTES (DESDE RELATÓRIOS ANTERIORES)
+--------------------------------------------------------------------------------
+• Painel: filtros avançados, dados agregados via API, mantendo `revalidate = 120`
+  e `Suspense`.
+• Upload de imagem de produto: Supabase Storage, fluxo URL assinada → cliente →
+  gravação de URL pública validada na API (`product_image_storage_url`).
+• Auditoria de protótipo: eventos persistidos em `prototype_audit_events` +
+  trilho de login pré-sessão com segredo partilhado (`PROTOTYPE_AUDIT_INGEST_SECRET`
+  documentado em `.env.example`).
+• UAT: leitura e escrita só pela API; utilizador de apresentação = nome de
+  sessão (`X-Username`) ou fallback para id; perfil = `X-Role`; viewers podem
+  consultar o checklist.
+
+================================================================================
+
+7. VARIÁVEIS DE AMBIENTE (RESUMO — ver `.env.example`)
+--------------------------------------------------------------------------------
+Obrigatórias / frequentes para o protótipo:
+  DATABASE_URL ou SUPABASE_DB_URL     — leituras Next em `queries.ts` onde
+                                        ainda existem
+  API_PROTOTYPE_URL                   — base URL da FastAPI de protótipo
+  AUTH_SESSION_SECRET                   — JWT do Next
+  ALIEH_TENANT_ID                     — tenant por omissão
+
+Opcionais / cenários específicos:
+  ALIEH_PROTOTYPE_OPEN, API_PROTOTYPE_USER_ID, API_PROTOTYPE_USERNAME
+  PROTOTYPE_AUDIT_INGEST_SECRET
+  NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY
+  SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_PRODUCT_IMAGES_BUCKET
+  (e demais chaves Supabase já usadas pelo ecossistema)
+
+================================================================================
+
+8. MATRIZ DE PARIDADE (STREAMLIT → PROTÓTIPO) — ATUALIZADA
+--------------------------------------------------------------------------------
+Legenda: [OK] boa aderência | [P] parcial | [X] não coberto no protótipo
+
+| Área                         | Notas |
+|------------------------------|-----------------------------------------------|
+| Navegação principal          | [OK] TopNav com os módulos principais |
+| Autenticação / sessão        | [P] JWT + users BD; não replica toda a stack |
+| RBAC (admin/operator/viewer)| [P] aplicado no Next e na API onde ligado |
+| Painel executivo             | [P] API + filtros; não é o painel BI completo |
+| Produtos (lista/filtros)     | [P] API `search_products_filtered` via protótipo |
+| Produtos (detalhe / lote)    | [P] painel lateral; paridade total com Streamlit |
+| Imagem de produto            | [P] Supabase URL; legado local + base64 na API |
+| Custos / CMP                 | [P] escrita API; leituras ainda mistas queries+API |
+| Precificação                 | [P] API workflow + histórico em UI conforme rotas |
+| Estoque                      | [P] API listagem e mutações |
+| Clientes                     | [P] API |
+| Vendas                       | [P] registo via API; algumas leituras ainda SQL Next |
+| UAT                          | [P] persistência e utilizador reais via API |
+| Auditoria / logs críticos   | [P] tabela de protótipo + login ingest; não substitui |
+|                              |     `critical_log` em ficheiro |
+| Backup / admin SQLite        | [X] fora de âmbito do protótipo |
+
+================================================================================
+
+9. RISCOS E RECOMENDAÇÕES
+--------------------------------------------------------------------------------
+1. Dupla origem de leitura (SQL em `queries.ts` vs API) — risco de divergência de
+   filtros, tenant e cache. Recomendação: migrar as páginas restantes (`/sales`,
+   `/costs`, `/api/batches`) para endpoints da api-prototype alinhados às queries
+   Python existentes.
+
+2. DDL em arranque (`prototype_audit_events`) — aceitável em ambiente de
+   protótipo; validar política de migrações em produção antes de qualquer
+   promoção.
+
+3. Segredos: `PROTOTYPE_AUDIT_INGEST_SECRET` e `SUPABASE_SERVICE_ROLE_KEY` devem
+   permanecer apenas no servidor; nunca no bundle cliente.
+
+4. Testes E2E (Playwright) contra staging com os casos UAT-M-* continuam
+   recomendados antes de substituir a UI Streamlit.
+
+================================================================================
+
+10. PRÓXIMOS PASSOS SUGERIDOS (CHECKLIST)
+--------------------------------------------------------------------------------
+[ ] Unificar leituras: eliminar dependências remanescentes de `queries.ts` nas
+    rotas `/sales`, `/costs` e `/api/batches`, passando tudo pela api-prototype.
+[ ] Documentar contrato OpenAPI ou equivalente gerado a partir das rotas FastAPI.
+[ ] Cobertura de testes de integração (API + Next) para fluxos críticos de venda
+    e precificação.
+[ ] Decisão de produto: promover `prototype_audit_events` vs integrar apenas em
+    ferramentas de observabilidade externas.
+[ ] Rever limites de `revalidate` por rota após carga real (consistência vs UX).
+
+================================================================================
+FIM DO RELATÓRIO — PROTÓTIPO NEXT.JS / API DE PROTÓTIPO
+================================================================================

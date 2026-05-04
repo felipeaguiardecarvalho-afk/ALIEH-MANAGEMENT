@@ -1017,9 +1017,16 @@ def fetch_low_stock_products_dashboard(
     )
 
 
-def fetch_inventory_stock_summary(tenant_id: str | None = None) -> dict[str, Any]:
-    """Unidades totais e valor a CMP (custo médio no lote × stock)."""
+def fetch_inventory_stock_summary(
+    tenant_id: str | None = None, *, critical_threshold: float = 5.0
+) -> dict[str, Any]:
+    """Unidades totais e valor a CMP (custo médio no lote × stock).
+
+    ``critical_threshold``: produtos com ``stock <=`` este valor entram em ``n_critical_skus``.
+    O painel web usa 1.0; o default 5.0 mantém paridade com o Streamlit.
+    """
     tid = effective_tenant_id_for_request(tenant_id)
+    thr = float(critical_threshold)
     with use_connection(None) as conn:
         row = db_execute(
             conn,
@@ -1039,9 +1046,9 @@ def fetch_inventory_stock_summary(tenant_id: str | None = None) -> dict[str, Any
             """
             SELECT COUNT(*) AS c
             FROM products
-            WHERE tenant_id = %s AND deleted_at IS NULL AND COALESCE(stock, 0) <= 5;
+            WHERE tenant_id = %s AND deleted_at IS NULL AND COALESCE(stock, 0) <= %s;
             """,
-            (tid,),
+            (tid, thr),
         ).fetchone()
     return {
         "total_units": float(row["units"] or 0),

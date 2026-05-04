@@ -1,0 +1,12 @@
+---
+description: Protótipo web canónico ALIEH — sempre web-prototype na porta 3000
+alwaysApply: true
+---
+
+# Protótipo oficial ALIEH
+
+- **Versão oficial do protótipo Next.js:** pasta **`web-prototype/`**, a correr em **`http://localhost:3000`** (`npm run dev` na raiz do repo ou `npm run dev` dentro de `web-prototype/`).
+- **API associada:** **`api-prototype/`** (FastAPI), URL base em `API_PROTOTYPE_URL` (ex. `http://127.0.0.1:8000`).
+- **Implementar e editar** rotas, páginas, componentes e `lib/` do protótipo **apenas** sob `web-prototype/`, salvo pedido explícito em contrário.
+- **Não tratar como destino principal:** Next na raiz (`app/`, `components/` na raiz) — legado; worktrees `.claude/`; duplicados fora de `web-prototype/`.
+- Para contexto humano, ver **`PROTOTIPO_OFICIAL.md`** na raiz do repositório.
