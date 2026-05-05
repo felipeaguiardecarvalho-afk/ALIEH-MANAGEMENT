@@ -180,8 +180,7 @@ function InventoryHeader() {
       <p className="text-[11px] uppercase tracking-[0.32em] text-[#d4b36c]">Operação · Estoque</p>
       <h1 className="mt-2 font-serif text-5xl font-semibold tracking-tight md:text-6xl">Cockpit de estoque</h1>
       <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-        Lotes com stock, filtros multidimensionais e ordenação via API · baixa manual com optimistic UI · exclusão
-        de lote por código de entrada (zera stock, custo e preço).
+        Lotes com stock, filtros multidimensionais e baixa manual por código de entrada (zera stock, custo e preço).
       </p>
     </header>
   );

@@ -61,10 +61,7 @@ export default async function SalesPage() {
         <Card>
           <CardHeader>
             <CardTitle>Vendas recentes</CardTitle>
-            <CardDescription>
-              Últimas 20 vendas via <code className="rounded bg-muted px-1">GET /sales/recent?limit=20</code> — mesma
-              origem que o serviço de vendas.
-            </CardDescription>
+            <CardDescription>Últimas 20 vendas.</CardDescription>
           </CardHeader>
           <CardContent>
             {items.length === 0 ? (

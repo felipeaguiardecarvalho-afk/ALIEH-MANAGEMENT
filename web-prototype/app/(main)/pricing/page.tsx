@@ -90,9 +90,7 @@ function PricingHeader() {
       <p className="text-[11px] uppercase tracking-[0.32em] text-[#d4b36c]">Financeiro · Precificação</p>
       <h1 className="mt-2 font-serif text-5xl font-semibold tracking-tight md:text-6xl">Pricing engine</h1>
       <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-        Configure margem, impostos e encargos por SKU. O cálculo usa o mesmo motor que persiste; ao salvar, o
-        preço alvo propaga para <code className="rounded bg-muted px-1 text-xs">sku_master.selling_price</code> e{" "}
-        <code className="rounded bg-muted px-1 text-xs">products.price</code>.
+        Configure margem, impostos e encargos por SKU.
       </p>
     </header>
   );

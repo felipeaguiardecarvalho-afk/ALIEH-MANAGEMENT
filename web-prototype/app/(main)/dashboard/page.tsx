@@ -27,11 +27,6 @@ export default async function DashboardPage({
           <h1 className="mt-2 font-serif text-5xl font-semibold tracking-tight md:text-6xl">
             Painel executivo
           </h1>
-          <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Sinais críticos, performance de produto e ações recomendadas — em tempo quase real.
-            Paridade com o painel Streamlit: presets, deltas vs período anterior, MM7, cohort, margem por SKU,
-            stock crítico e envelhecimento.
-          </p>
         </div>
       </header>
 
