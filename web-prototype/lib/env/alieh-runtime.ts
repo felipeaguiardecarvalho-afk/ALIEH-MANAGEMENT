@@ -29,10 +29,18 @@ export function isStagingTier(): boolean {
 
 /**
  * Modo aberto (sem login) só em desenvolvimento/staging — nunca em produção, mesmo se a env estiver errada.
+ * Em `next dev`, se `AUTH_SESSION_SECRET` estiver vazio, equivale a modo aberto (só tier development).
  */
 export function isPrototypeOpenEffective(): boolean {
   if (isProductionTier()) return false;
-  return process.env[PROTOTYPE_OPEN_ENV] === "1";
+  if (process.env[PROTOTYPE_OPEN_ENV] === "1") return true;
+  if (
+    getAliehEnv() === "development" &&
+    !(process.env.AUTH_SESSION_SECRET || "").trim()
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function requireNonEmpty(name: string, value: string | undefined, context: string): void {

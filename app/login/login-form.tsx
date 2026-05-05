@@ -23,7 +23,8 @@ export function LoginForm({ tenantOptions, showTenantPicker, openMode }: Props) 
     return (
       <div className="space-y-3 text-sm text-muted-foreground">
         <p>
-          Modo aberto: <code className="text-xs">ALIEH_PROTOTYPE_OPEN=1</code> — o middleware não exige sessão.
+          Modo aberto (dev sem <code className="text-xs">AUTH_SESSION_SECRET</code> ou{" "}
+          <code className="text-xs">ALIEH_PROTOTYPE_OPEN=1</code>) — o middleware não exige sessão.
         </p>
         <Link
           href="/dashboard"

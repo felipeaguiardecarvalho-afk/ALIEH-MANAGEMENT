@@ -26,5 +26,13 @@ export function isStagingTier(): boolean {
 
 export function isPrototypeOpenEffective(): boolean {
   if (isProductionTier()) return false;
-  return process.env[PROTOTYPE_OPEN_ENV] === "1";
+  if (process.env[PROTOTYPE_OPEN_ENV] === "1") return true;
+  // `next dev` sem AUTH_SESSION_SECRET: mesmo comportamento que modo aberto (só tier development).
+  if (
+    getAliehEnv() === "development" &&
+    !(process.env.AUTH_SESSION_SECRET || "").trim()
+  ) {
+    return true;
+  }
+  return false;
 }
