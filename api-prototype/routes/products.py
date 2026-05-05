@@ -69,7 +69,7 @@ def _serialize_detail_row(row, *, tenant_id: str | None) -> dict:
 
 
 @router.get("/attribute-options")
-def get_product_attribute_options(actor: Actor = Depends(get_actor)):
+def get_product_attribute_options(actor: Actor = Depends(get_actor_read)):
     from database.repositories import query_repository as qr
 
     return qr.fetch_product_search_attribute_options(actor.tenant_id)
@@ -86,7 +86,7 @@ def get_products_list(
     sort: str = "sku",
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=200),
-    actor: Actor = Depends(get_actor),
+    actor: Actor = Depends(get_actor_read),
 ):
     from database.repositories import query_repository as qr
 
@@ -118,7 +118,7 @@ def get_sku_body_preview(
     gender: str = Query(""),
     palette: str = Query(""),
     style: str = Query(""),
-    _actor: Actor = Depends(get_actor),
+    _actor: Actor = Depends(get_actor_read),
 ):
     """Pré-visualização read-only do corpo de SKU (paridade Streamlit: ``XXX-{corpo}``)."""
     from database.repositories.sku_codec_repository import build_product_sku_body
@@ -163,7 +163,7 @@ def get_product_image_file(product_id: int, actor: Actor = Depends(get_actor_rea
 
 
 @router.get("/{product_id}")
-def get_product_by_id(product_id: int, actor: Actor = Depends(get_actor)):
+def get_product_by_id(product_id: int, actor: Actor = Depends(get_actor_read)):
     from database.repositories import query_repository as qr
 
     row = qr.fetch_product_by_id(product_id, actor.tenant_id)

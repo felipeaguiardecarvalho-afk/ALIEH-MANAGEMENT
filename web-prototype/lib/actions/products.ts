@@ -1,7 +1,13 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { apiPrototypeFetch, gateMutation, hasPrototypeApiUrl, readApiError } from "@/lib/api-prototype";
+import {
+  apiPrototypeFetch,
+  apiPrototypeFetchRead,
+  gateMutation,
+  hasPrototypeApiUrl,
+  readApiError,
+} from "@/lib/api-prototype";
 import { requireAdmin } from "@/lib/rbac";
 
 export type ProductFormState = { ok: boolean; message: string };
@@ -40,7 +46,7 @@ export async function previewProductSkuBodyAction(input: {
       palette,
       style,
     });
-    const res = await apiPrototypeFetch(`/products/sku-body-preview?${params.toString()}`);
+    const res = await apiPrototypeFetchRead(`/products/sku-body-preview?${params.toString()}`);
     if (!res.ok) return { preview: null };
     return (await res.json()) as SkuBodyPreviewResult;
   } catch {

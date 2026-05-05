@@ -1,6 +1,6 @@
 import "server-only";
 
-import { apiPrototypeFetch, apiPrototypeFetchRead, readApiError } from "@/lib/api-prototype";
+import { apiPrototypeFetchRead, readApiError } from "@/lib/api-prototype";
 import type { ProductCatalogQuery } from "@/lib/products-url";
 
 export type ProductAttributeOptions = {
@@ -76,7 +76,7 @@ function listQueryFromCatalog(q: ProductCatalogQuery): string {
 
 export async function fetchPrototypeProductList(q: ProductCatalogQuery): Promise<ProductListResponse> {
   const qs = listQueryFromCatalog(q);
-  const res = await apiPrototypeFetch(`/products${qs}`);
+  const res = await apiPrototypeFetchRead(`/products${qs}`);
   if (!res.ok) {
     throw new Error(await readApiError(res));
   }
@@ -84,7 +84,7 @@ export async function fetchPrototypeProductList(q: ProductCatalogQuery): Promise
 }
 
 export async function fetchPrototypeProductAttributeOptions(): Promise<ProductAttributeOptions> {
-  const res = await apiPrototypeFetch("/products/attribute-options");
+  const res = await apiPrototypeFetchRead("/products/attribute-options");
   if (!res.ok) {
     throw new Error(await readApiError(res));
   }
@@ -92,7 +92,7 @@ export async function fetchPrototypeProductAttributeOptions(): Promise<ProductAt
 }
 
 export async function fetchPrototypeProductDetail(id: number): Promise<ProductDetail | null> {
-  const res = await apiPrototypeFetch(`/products/${id}`);
+  const res = await apiPrototypeFetchRead(`/products/${id}`);
   if (res.status === 404) return null;
   if (!res.ok) {
     throw new Error(await readApiError(res));
