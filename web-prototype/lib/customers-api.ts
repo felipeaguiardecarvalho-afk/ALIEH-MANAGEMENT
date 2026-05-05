@@ -25,7 +25,7 @@ export type CustomerApiRow = {
 };
 
 async function fetchPrototypeCustomersListUncached(): Promise<CustomerApiRow[]> {
-  const res = await apiPrototypeFetchRead("/customers", { cache: "no-store" });
+  const res = await apiPrototypeFetchRead("/customers");
   if (!res.ok) throw new Error(await readApiError(res));
   const data = (await res.json()) as { items: CustomerApiRow[] };
   return data.items ?? [];
@@ -35,7 +35,7 @@ async function fetchPrototypeCustomersListUncached(): Promise<CustomerApiRow[]> 
 export const fetchPrototypeCustomersList = cache(fetchPrototypeCustomersListUncached);
 
 async function fetchPrototypeCustomerUncached(id: number): Promise<CustomerApiRow | null> {
-  const res = await apiPrototypeFetchRead(`/customers/${id}`, { cache: "no-store" });
+  const res = await apiPrototypeFetchRead(`/customers/${id}`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(await readApiError(res));
   return (await res.json()) as CustomerApiRow;

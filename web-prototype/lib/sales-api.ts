@@ -65,7 +65,7 @@ type SaleableSkuApiRow = {
 };
 
 async function fetchPrototypeSaleableSkusUncached(): Promise<SaleableSku[]> {
-  const res = await apiPrototypeFetchRead("/sales/saleable-skus", { cache: "no-store" });
+  const res = await apiPrototypeFetchRead("/sales/saleable-skus");
   if (!res.ok) {
     throw new Error(await readApiError(res));
   }

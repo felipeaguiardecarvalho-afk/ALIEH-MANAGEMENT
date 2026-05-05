@@ -6,21 +6,27 @@ import { fetchPrototypeCustomersList } from "@/lib/customers-api";
 import { fetchPrototypeSaleableSkus } from "@/lib/sales-api";
 import type { Customer, SaleableSku } from "@/lib/types";
 
-export const dynamic = "force-dynamic";
+export const revalidate = 30;
 
 export default async function NewSalePage() {
   let skus: SaleableSku[] = [];
   let customers: Customer[] = [];
   let loadError: string | null = null;
 
-  try {
-    const [skuData, custRows] = await Promise.all([
-      fetchPrototypeSaleableSkus(),
-      fetchPrototypeCustomersList(),
-    ]);
-    skus = skuData;
-    customers = mapCustomerApiRowsToCustomers(custRows);
-  } catch (e) {
+  const [skuOutcome, customersOutcome] = await Promise.allSettled([
+    fetchPrototypeSaleableSkus(),
+    fetchPrototypeCustomersList(),
+  ]);
+  if (skuOutcome.status === "fulfilled") {
+    skus = skuOutcome.value;
+  } else {
+    const e = skuOutcome.reason;
+    loadError = e instanceof Error ? e.message : "Falha ao carregar dados da API.";
+  }
+  if (customersOutcome.status === "fulfilled") {
+    customers = mapCustomerApiRowsToCustomers(customersOutcome.value);
+  } else if (!loadError) {
+    const e = customersOutcome.reason;
     loadError = e instanceof Error ? e.message : "Falha ao carregar dados da API.";
   }
 

@@ -63,7 +63,7 @@ function lotsQueryString(q: InventoryLotsQuery, overrides?: Record<string, strin
 }
 
 async function fetchPrototypeInventoryLotOptionsUncached(): Promise<InventoryLotFilterOptions> {
-  const res = await apiPrototypeFetchRead("/inventory/lots/filter-options", { cache: "no-store" });
+  const res = await apiPrototypeFetchRead("/inventory/lots/filter-options");
   if (!res.ok) throw new Error(await readApiError(res));
   return (await res.json()) as InventoryLotFilterOptions;
 }
@@ -81,7 +81,7 @@ async function fetchPrototypeInventoryLotsUncached(
     page: p.page,
     page_size: p.page_size,
   });
-  const res = await apiPrototypeFetchRead(`/inventory/lots${qs}`, { cache: "no-store" });
+  const res = await apiPrototypeFetchRead(`/inventory/lots${qs}`);
   if (!res.ok) throw new Error(await readApiError(res));
   const body = (await res.json()) as InventoryLotsResponse;
   return {
@@ -117,7 +117,7 @@ export async function fetchPrototypeBatchesForSkuCached(sku: string): Promise<Pr
 
   const p = (async (): Promise<ProductBatch[]> => {
     const res = await apiPrototypeFetchRead(`/inventory/batches?sku=${encodeURIComponent(s)}`, {
-      cache: "no-store",
+      next: { revalidate: 20 },
     });
     if (!res.ok) return [];
     const data = (await res.json()) as {

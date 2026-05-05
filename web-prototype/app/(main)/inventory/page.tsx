@@ -11,7 +11,7 @@ import { InventoryKpiStrip } from "./inventory-kpi-strip";
 import { InventoryLotsInteractive } from "./inventory-lots-interactive";
 import { WriteDownForm } from "./write-down-form";
 
-export const revalidate = 0;
+export const revalidate = 30;
 
 function hasActiveFilters(q: InventoryLotsQuery): boolean {
   const keys: (keyof InventoryLotsQuery)[] = [
@@ -60,15 +60,32 @@ export default async function InventoryPage({
   let globalStock: Awaited<ReturnType<typeof fetchPrototypeInventoryLots>> | null = null;
   let writeDownLots: Awaited<ReturnType<typeof fetchPrototypeInventoryLots>> | null = null;
 
-  try {
-    [list, options, globalStock, writeDownLots] = await Promise.all([
-      fetchPrototypeInventoryLots(listQuery),
-      fetchPrototypeInventoryLotOptions(),
-      fetchPrototypeInventoryLots({ sort: "name" }, { page: "1", page_size: "1" }),
-      fetchPrototypeInventoryLots({ sort: "name" }),
-    ]);
-  } catch (e) {
+  const [listOutcome, optionsOutcome, globalOutcome, writeDownOutcome] = await Promise.allSettled([
+    fetchPrototypeInventoryLots(listQuery),
+    fetchPrototypeInventoryLotOptions(),
+    fetchPrototypeInventoryLots({ sort: "name" }, { page: "1", page_size: "1" }),
+    fetchPrototypeInventoryLots({ sort: "name" }),
+  ]);
+  if (listOutcome.status === "fulfilled") {
+    list = listOutcome.value;
+  } else {
+    const e = listOutcome.reason;
     error = e instanceof Error ? e.message : "Não foi possível carregar o inventário.";
+  }
+  if (optionsOutcome.status === "fulfilled") {
+    options = optionsOutcome.value;
+  } else if (!error) {
+    const e = optionsOutcome.reason;
+    error = e instanceof Error ? e.message : "Não foi possível carregar o inventário.";
+  }
+  if (globalOutcome.status === "fulfilled") {
+    globalStock = globalOutcome.value;
+  }
+  if (writeDownOutcome.status === "fulfilled") {
+    writeDownLots = writeDownOutcome.value;
+  }
+  if (!error && (!globalStock || !writeDownLots)) {
+    error = "Dados auxiliares de inventário indisponíveis no momento. Tente novamente.";
   }
 
   const noStockAnywhere = !error && globalStock && globalStock.total === 0;

@@ -7,9 +7,8 @@ import {
 import { DashboardFilters } from "./dashboard-filters";
 import { normalizeDashboardQuery } from "@/lib/dashboard-url";
 
-/** Painel depende da API em tempo real; evita HTML/cache de dados antigos (ex.: tabela stock ≤ 1). */
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
+/** Cache curto para reduzir carga no upstream sem alterar fluxo funcional. */
+export const revalidate = 30;
 
 export default async function DashboardPage({
   searchParams,

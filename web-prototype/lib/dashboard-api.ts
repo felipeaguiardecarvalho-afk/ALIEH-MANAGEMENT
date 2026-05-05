@@ -160,9 +160,7 @@ export async function fetchPrototypeDashboardFilters(): Promise<DashboardFilterO
 export async function fetchPrototypeDashboardPanel(
   q: DashboardQuery
 ): Promise<DashboardPanelResponse> {
-  const res = await apiPrototypeFetchRead(`/dashboard/panel${panelQueryString(q)}`, {
-    cache: "no-store",
-  });
+  const res = await apiPrototypeFetchRead(`/dashboard/panel${panelQueryString(q)}`);
   if (!res.ok) throw new Error(await readApiError(res));
   return (await res.json()) as DashboardPanelResponse;
 }

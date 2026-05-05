@@ -16,8 +16,8 @@ type PrototypeFetchInit = RequestInit & {
 };
 
 const IS_PRODUCTION_TIER = (process.env.VERCEL_ENV || "").trim().toLowerCase() === "production";
-const READ_TIMEOUT_MS = IS_PRODUCTION_TIER ? 25000 : 12000;
-const WRITE_TIMEOUT_MS = IS_PRODUCTION_TIER ? 30000 : 15000;
+const READ_TIMEOUT_MS = IS_PRODUCTION_TIER ? 55000 : 15000;
+const WRITE_TIMEOUT_MS = IS_PRODUCTION_TIER ? 45000 : 20000;
 
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
 
@@ -234,7 +234,7 @@ export async function apiPrototypeFetchRead(
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   };
-  return isGet ? fetchReadWithRetry(url, requestInit, IS_PRODUCTION_TIER ? 2 : 1) : prototypeUndiciFetch(url, requestInit);
+  return isGet ? fetchReadWithRetry(url, requestInit, IS_PRODUCTION_TIER ? 3 : 1) : prototypeUndiciFetch(url, requestInit);
 }
 
 export async function apiPrototypeFetch(
@@ -266,6 +266,12 @@ export async function apiPrototypeFetch(
 
 export async function readApiError(res: Response): Promise<string> {
   const text = await res.text();
+  if (typeof text === "string" && /<html[\s>]|<!doctype html>/i.test(text)) {
+    if (res.status >= 500) {
+      return "Serviço temporariamente indisponível (upstream 5xx). Tente novamente em alguns segundos.";
+    }
+    return "Resposta inválida do serviço (HTML em vez de JSON).";
+  }
   try {
     const j = JSON.parse(text) as { detail?: unknown };
     if (typeof j.detail === "string") return j.detail;

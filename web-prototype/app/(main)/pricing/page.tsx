@@ -5,7 +5,7 @@ import { fetchPrototypeSkuMasterList } from "@/lib/pricing-api";
 import { requireAdminForPricing } from "@/lib/rbac";
 import { PricingWorkflow } from "./pricing-workflow";
 
-export const dynamic = "force-dynamic";
+export const revalidate = 30;
 
 export default async function PricingPage() {
   const denied = await requireAdminForPricing();
@@ -27,12 +27,20 @@ export default async function PricingPage() {
   let masters: Awaited<ReturnType<typeof fetchPrototypeSkuMasterList>> = [];
   let pickByName: Awaited<ReturnType<typeof fetchCostsSkuOptions>>["pick_by_name"] = [];
 
-  try {
-    [masters, { pick_by_name: pickByName }] = await Promise.all([
-      fetchPrototypeSkuMasterList(),
-      fetchCostsSkuOptions(),
-    ]);
-  } catch (e) {
+  const [mastersOutcome, optionsOutcome] = await Promise.allSettled([
+    fetchPrototypeSkuMasterList(),
+    fetchCostsSkuOptions(),
+  ]);
+  if (mastersOutcome.status === "fulfilled") {
+    masters = mastersOutcome.value;
+  } else {
+    const e = mastersOutcome.reason;
+    error = e instanceof Error ? e.message : "Não foi possível carregar SKUs.";
+  }
+  if (optionsOutcome.status === "fulfilled") {
+    pickByName = optionsOutcome.value.pick_by_name;
+  } else if (!error) {
+    const e = optionsOutcome.reason;
     error = e instanceof Error ? e.message : "Não foi possível carregar SKUs.";
   }
 
