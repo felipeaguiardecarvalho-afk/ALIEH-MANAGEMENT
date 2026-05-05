@@ -21,7 +21,9 @@
     "test:pg": "pytest tests/test_postgres_integration.py -v --tb=short",
     "test:gate": "npm run test:unit && npm run test:api && npm run test:pg && npm run test:e2e",
     "test:e2e": "npm --prefix tests/e2e run test",
-    "ci:seed-e2e": "python scripts/ci/seed_e2e_user.py"
+    "ci:seed-e2e": "python scripts/ci/seed_e2e_user.py",
+    "deploy:vercel:env": "node scripts/deploy/vercel-env-sync.mjs",
+    "deploy:vercel": "npm run deploy:vercel:env && npx vercel@latest deploy --prod --yes --cwd web-prototype"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",

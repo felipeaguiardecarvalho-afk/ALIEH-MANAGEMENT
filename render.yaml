@@ -5,9 +5,11 @@
 services:
   - type: web
     name: alieh-api-prototype
+    repo: https://github.com/felipeaguiardecarvalho-afk/ALIEH-MANAGEMENT
     runtime: python
-    plan: starter
-    region: oregon
+    plan: free
+    branch: master
+    region: frankfurt
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt -r api-prototype/requirements.txt
     startCommand: cd api-prototype && export PYTHONPATH=.. && uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health

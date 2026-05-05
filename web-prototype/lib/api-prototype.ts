@@ -51,7 +51,8 @@ function isLikelyConnectionFailure(e: unknown): boolean {
   if (c instanceof Error) {
     const cm = (c.message || "").toLowerCase();
     if (cm.includes("econnrefused") || cm.includes("enotfound") || cm.includes("eai_again")) return true;
-    const code = typeof (c as { code?: unknown }).code === "string" ? (c as { code: string }).code : "";
+    const causeCode = (c as unknown as { code?: unknown }).code;
+    const code = typeof causeCode === "string" ? causeCode : "";
     if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "ETIMEDOUT") return true;
   }
   return false;
