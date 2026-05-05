@@ -30,6 +30,7 @@
     "@tanstack/react-table": "latest",
     "class-variance-authority": "latest",
     "clsx": "latest",
+    "jose": "^5.10.0",
     "lucide-react": "latest",
     "next": "latest",
     "postgres": "latest",

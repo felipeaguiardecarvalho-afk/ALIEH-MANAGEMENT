@@ -3,6 +3,7 @@ import "server-only";
 import { cookies } from "next/headers";
 
 import { PROTOTYPE_OPEN_ENV } from "@/lib/auth/constants";
+import { getSession } from "@/lib/auth/session";
 import { canMutate, resolveRole, resolveTenantId } from "@/lib/tenant";
 
 export type GateFail = { ok: false; message: string };
@@ -38,6 +39,13 @@ export async function gateMutation(): Promise<GateFail | null> {
 }
 
 async function resolveActorIds(): Promise<{ userId: string; username?: string }> {
+  const session = await getSession();
+  if (session?.userId?.trim()) {
+    return {
+      userId: session.userId.trim(),
+      username: session.username?.trim() || undefined,
+    };
+  }
   const cookieStore = await cookies();
   const fromCookie = cookieStore.get("alieh_user_id")?.value?.trim();
   const fromEnv = process.env.API_PROTOTYPE_USER_ID?.trim();

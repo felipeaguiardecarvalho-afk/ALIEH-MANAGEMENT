@@ -1,22 +1,33 @@
 import "server-only";
 import { cookies } from "next/headers";
 import { getTenantId as getDefaultTenantId } from "@/lib/db";
+import { getSession } from "@/lib/auth/session";
+
+import type { Role } from "@/lib/role";
+
+export type { Role } from "@/lib/role";
 
 const TENANT_COOKIE = "alieh_tenant";
 
 export async function resolveTenantId() {
+  const session = await getSession();
+  if (session?.tenantId?.trim()) {
+    return session.tenantId.trim();
+  }
   const cookieStore = await cookies();
   const fromCookie = cookieStore.get(TENANT_COOKIE)?.value?.trim();
   return fromCookie || getDefaultTenantId();
 }
 
-export type Role = "admin" | "operator" | "viewer";
-
 /**
- * Em `next dev`, sem cookie `alieh_role`, o perfil vem de `ALIEH_DEV_ROLE` ou assume `admin`
- * para o protótipo local funcionar sem fluxo de login (produção continua `viewer` por omissão).
+ * Prioridade: JWT de sessão → cookie legacy `alieh_role` → `next dev` (ALIEH_DEV_ROLE ou admin)
+ * → produção sem sessão (`viewer`).
  */
 export async function resolveRole(): Promise<Role> {
+  const session = await getSession();
+  if (session?.role) {
+    return session.role;
+  }
   const cookieStore = await cookies();
   const raw = cookieStore.get("alieh_role")?.value;
   if (raw === "admin" || raw === "operator" || raw === "viewer") {

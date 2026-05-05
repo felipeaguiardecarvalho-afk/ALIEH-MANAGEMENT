@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Gem, Menu } from "lucide-react";
+import { Gem, LogOut, Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { logout } from "@/lib/actions/auth";
 
 const navItems = [
   { href: "/dashboard", label: "Painel" },
@@ -34,7 +35,7 @@ export function TopNav() {
           </span>
         </Link>
 
-        <nav className="hidden items-center gap-0.5 lg:flex">
+        <nav className="hidden items-center gap-1 lg:flex">
           {navItems.map((item) => {
             const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
             return (
@@ -51,6 +52,16 @@ export function TopNav() {
               </Link>
             );
           })}
+          <form action={logout} className="ml-2 border-l border-white/10 pl-3">
+            <button
+              type="submit"
+              className="inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
+              title="Terminar sessão"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              Sair
+            </button>
+          </form>
         </nav>
 
         <details className="relative lg:hidden">
@@ -68,6 +79,15 @@ export function TopNav() {
                 {item.label}
               </Link>
             ))}
+            <form action={logout} className="border-t border-white/10 pt-2">
+              <button
+                type="submit"
+                className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm text-muted-foreground hover:bg-white/5 hover:text-foreground"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sair
+              </button>
+            </form>
           </div>
         </details>
       </div>

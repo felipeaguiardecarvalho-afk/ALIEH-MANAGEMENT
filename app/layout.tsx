@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Inter, Playfair_Display } from "next/font/google";
 import "./globals.css";
-import { TopNav } from "@/components/top-nav";
+import { RootChrome } from "@/components/root-chrome";
 
 const inter = Inter({
   subsets: ["latin"],
@@ -32,10 +32,7 @@ export default function RootLayout({
       className={`${inter.variable} ${playfair.variable} dark`}
     >
       <body className="antialiased">
-        <TopNav />
-        <main className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-          {children}
-        </main>
+        <RootChrome>{children}</RootChrome>
       </body>
     </html>
   );
