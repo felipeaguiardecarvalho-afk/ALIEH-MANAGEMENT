@@ -15,6 +15,10 @@ type PrototypeFetchInit = RequestInit & {
   next?: { revalidate?: number; tags?: string[] };
 };
 
+const IS_PRODUCTION_TIER = (process.env.VERCEL_ENV || "").trim().toLowerCase() === "production";
+const READ_TIMEOUT_MS = IS_PRODUCTION_TIER ? 25000 : 12000;
+const WRITE_TIMEOUT_MS = IS_PRODUCTION_TIER ? 30000 : 15000;
+
 /** Evita API_PROTOTYPE_URL=http://127.0.0.1:3000 (mesmo host/porta do Next) → 404 "Not Found" em /sales/... */
 function assertPrototypeApiNotSamePortAsNext(base: string): void {
   let parsed: URL;
@@ -202,7 +206,7 @@ export async function apiPrototypeFetchRead(
       ? { ...(next || {}), revalidate: next?.revalidate ?? 30 }
       : next,
     cache: isGet ? (rest.cache ?? "force-cache") : (rest.cache ?? "no-store"),
-    signal: rest.signal ?? AbortSignal.timeout(isGet ? 8000 : 12000),
+    signal: rest.signal ?? AbortSignal.timeout(isGet ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS),
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });
@@ -229,7 +233,7 @@ export async function apiPrototypeFetch(
     method,
     next,
     cache: rest.cache ?? "no-store",
-    signal: rest.signal ?? AbortSignal.timeout(12000),
+    signal: rest.signal ?? AbortSignal.timeout(WRITE_TIMEOUT_MS),
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });
