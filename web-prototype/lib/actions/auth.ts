@@ -67,8 +67,26 @@ export async function login(
     return { ok: false, message: "AUTH_SESSION_SECRET não configurado no servidor." };
   }
 
-  const hasUsers = (await countUsers()) > 0;
   const legacy = legacyCredentialsConfigured();
+
+  /** Login legacy primeiro: evita esperar pela BD se `DATABASE_URL` estiver errada ou lenta. */
+  if (legacy && legacyLoginOk(username, password)) {
+    const row = await fetchUserByUsername("default", username);
+    let userId = (process.env.ALIEH_AUTH_USER_ID || "").trim() || "legacy";
+    let role = "admin";
+    if (row) {
+      userId = String(row.id);
+      role = roleFromRow(row.role);
+    }
+    await establishSession({
+      userId,
+      username,
+      role,
+      tenantId: "default",
+    });
+  }
+
+  const hasUsers = (await countUsers()) > 0;
 
   if (!hasUsers && !legacy) {
     return {
@@ -98,22 +116,6 @@ export async function login(
       detail: { reason: "bad_credentials" },
     });
     return { ok: false, message: "Credenciais inválidas." };
-  }
-
-  if (legacy && legacyLoginOk(username, password)) {
-    const row = await fetchUserByUsername("default", username);
-    let userId = (process.env.ALIEH_AUTH_USER_ID || "").trim() || "legacy";
-    let role = "admin";
-    if (row) {
-      userId = String(row.id);
-      role = roleFromRow(row.role);
-    }
-    await establishSession({
-      userId,
-      username,
-      role,
-      tenantId: "default",
-    });
   }
 
   const rowFallback = await fetchUserByUsername(loginTenant, username);

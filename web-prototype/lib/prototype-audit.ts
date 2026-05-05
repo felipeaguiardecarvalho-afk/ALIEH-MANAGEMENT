@@ -40,8 +40,13 @@ export async function logPrototypeLoginIngest(input: LoginIngestInput): Promise<
     if (!secret || !raw) return;
     const base = raw.replace(/\/$/, "");
 
+    const ctl =
+      typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
+        ? AbortSignal.timeout(8000)
+        : undefined;
     const res = await fetch(`${base}/audit/login-ingest`, {
       method: "POST",
+      signal: ctl,
       headers: {
         "Content-Type": "application/json",
         "X-Prototype-Audit-Secret": secret,
