@@ -47,7 +47,8 @@ def test_database_selected_log_fallback_mode(caplog, reload_db_config, monkeypat
     import logging
 
     monkeypatch.delenv("DB_PROVIDER", raising=False)
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for k in ("DATABASE_URL", "SUPABASE_DB_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL"):
+        monkeypatch.delenv(k, raising=False)
     cfg = reload_db_config()
     caplog.set_level(logging.INFO, logger="database.config")
     cfg.get_database_provider()
@@ -64,7 +65,7 @@ def test_database_selected_log_postgres_url(caplog, reload_db_config, monkeypatc
     caplog.set_level(logging.INFO, logger="database.config")
     cfg.get_database_provider()
     assert any(
-        "Database selected: postgres (DATABASE_URL detected)" in r.message
+        "Database selected: postgres (postgres DSN configured)" in r.message
         for r in caplog.records
     )
 
@@ -186,7 +187,7 @@ def test_get_postgres_conn_uses_supabase_url(reload_db_config, monkeypatch):
         p.assert_called_once()
         assert p.call_args.args[0] == "postgresql://user:pass@localhost:5432/db?sslmode=require"
         assert p.call_args.kwargs.get("autocommit") is True
-        assert p.call_args.kwargs.get("connect_timeout") == 5
+        assert p.call_args.kwargs.get("connect_timeout") == 15
         assert p.call_args.kwargs.get("keepalives") == 1
         assert p.call_args.kwargs.get("keepalives_idle") == 30
         assert p.call_args.kwargs.get("keepalives_interval") == 10
@@ -232,14 +233,14 @@ def test_get_postgres_conn_preserves_existing_sslmode(reload_db_config, monkeypa
 def test_get_postgres_conn_uses_fixed_connect_timeout_and_keepalives(
     reload_db_config, monkeypatch
 ):
-    """connect_timeout fixo (Cloud); DATABASE_CONNECT_TIMEOUT já não altera psycopg."""
-    for k in ("DATABASE_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL"):
+    """Defeito 15s; ``DATABASE_CONNECT_TIMEOUT`` legado não altera psycopg; ``POSTGRES_CONNECT_TIMEOUT`` sim."""
+    for k in ("DATABASE_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL", "POSTGRES_CONNECT_TIMEOUT"):
         monkeypatch.delenv(k, raising=False)
     reload_db_config(
         SUPABASE_DB_URL="postgresql://user:pass@localhost:5432/db",
         DATABASE_CONNECT_TIMEOUT="45",
     )
-    for k in ("DATABASE_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL"):
+    for k in ("DATABASE_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL", "POSTGRES_CONNECT_TIMEOUT"):
         monkeypatch.delenv(k, raising=False)
     import database.connection as conn
 
@@ -248,7 +249,36 @@ def test_get_postgres_conn_uses_fixed_connect_timeout_and_keepalives(
     with patch.object(conn.psycopg, "connect", return_value=mock) as p:
         conn.get_postgres_conn()
         assert p.call_args.args[0] == "postgresql://user:pass@localhost:5432/db?sslmode=require"
-        assert p.call_args.kwargs.get("connect_timeout") == 5
+        assert p.call_args.kwargs.get("connect_timeout") == 15
         assert p.call_args.kwargs.get("keepalives") == 1
+
+    monkeypatch.setenv("POSTGRES_CONNECT_TIMEOUT", "45")
+    reload_db_config(SUPABASE_DB_URL="postgresql://user:pass@localhost:5432/db")
+    for k in ("DATABASE_URL", "POSTGRES_DSN", "ALIEH_DATABASE_URL"):
+        monkeypatch.delenv(k, raising=False)
+    importlib.reload(conn)
+    mock = MagicMock()
+    with patch.object(conn.psycopg, "connect", return_value=mock) as p:
+        conn.get_postgres_conn()
+        assert p.call_args.kwargs.get("connect_timeout") == 45
+
+
+def test_get_postgres_conn_strips_wrapping_quotes_on_database_url(reload_db_config, monkeypatch):
+    reload_db_config(DATABASE_URL="'postgresql://u:p@localhost/db'")
+    import database.connection as conn
+
+    importlib.reload(conn)
+    mock = MagicMock()
+    with patch.object(conn.psycopg, "connect", return_value=mock) as p:
+        conn.get_postgres_conn()
+        assert p.call_args.args[0] == "postgresql://u:p@localhost/db?sslmode=require"
+
+
+def test_get_database_provider_postgres_when_supabase_url_only_no_database_url(
+    reload_db_config, monkeypatch
+):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = reload_db_config(SUPABASE_DB_URL="postgresql://u:p@localhost/db")
+    assert cfg.get_database_provider() == "postgres"
 
 

@@ -150,9 +150,9 @@ def get_database_provider() -> Literal["sqlite", "postgres"]:
             reason = "explicit DB_PROVIDER requests PostgreSQL"
         else:
             reason = "explicit DB_PROVIDER requests SQLite"
-    elif get_database_url():
+    elif get_postgres_dsn():
         provider = "postgres"
-        reason = "DATABASE_URL detected"
+        reason = "postgres DSN configured"
     else:
         provider = "sqlite"
         reason = "fallback mode"

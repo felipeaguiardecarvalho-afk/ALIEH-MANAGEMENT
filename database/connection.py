@@ -12,8 +12,8 @@
   Resolução DNS/host fica a cargo do libpq (:func:`psycopg.connect`) — sem ``hostaddr`` manual.
   ``prepare_threshold=0``, ``autocommit=True`` — sem comandos de sessão pós-conexão (compatível
   com PgBouncer / Supabase). Transacções explícitas usam ``conn.transaction()``. Cursores por
-  defeito ``binary=False``. ``connect_timeout=5``, keepalives TCP e :func:`connect_with_retry`
-  para ligações estáveis (ex.: Streamlit / Supabase).
+  defeito ``binary=False``. ``connect_timeout`` (15s por defeito; env ``POSTGRES_CONNECT_TIMEOUT`` 3–120),
+  keepalives TCP e :func:`connect_with_retry` para ligações estáveis (ex.: Streamlit / Supabase).
   Uma ligação por processo é reutilizada entre reruns Streamlit (cache com ``SELECT 1``); o
   ``close()`` na instância cacheada é um no-op para que ``with get_db_conn()`` não destrua o socket.
 
@@ -100,6 +100,25 @@ def _wrap_postgres_cursor_binary_false(conn: psycopg.Connection) -> None:
         return real(*args, **kwargs)
 
     conn.cursor = cursor  # type: ignore[method-assign]
+
+
+def _postgres_connect_timeout_sec() -> int:
+    """Timeout TCP na ligação inicial (nuvem / regiões distantes). Ignora ``DATABASE_CONNECT_TIMEOUT`` (legado)."""
+    raw = (os.environ.get("POSTGRES_CONNECT_TIMEOUT") or "").strip()
+    if not raw:
+        return 15
+    try:
+        return max(3, min(int(raw), 120))
+    except ValueError:
+        return 15
+
+
+def _strip_dsn_decorative_quotes(s: str) -> str:
+    """Remove aspas envolventes se o utilizador colou a URI como no ficheiro ``.env`` (``'postgresql://...'``)."""
+    t = (s or "").strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+        return t[1:-1].strip()
+    return t
 
 
 def _connection_cache_key(dsn: str, connect_kw: dict[str, Any]) -> tuple[Any, ...]:
@@ -298,10 +317,10 @@ def _ensure_postgres_dsn_sslmode_require(dsn: str) -> tuple[str, str]:
 
 
 def _require_postgres_dsn() -> str:
-    # :func:`get_database_url` → env ``DATABASE_URL`` + segredos Streamlit; depois Supabase / cadeia legacy.
+    # ``DATABASE_URL`` tem precedência sobre ``SUPABASE_DB_URL`` (paridade Streamlit / testes).
     direct = get_database_url()
     if direct:
-        return direct.strip()
+        return _strip_dsn_decorative_quotes(direct.strip())
     dsn = get_supabase_db_url() or get_postgres_dsn()
     if not dsn:
         raise RuntimeError(
@@ -309,7 +328,7 @@ def _require_postgres_dsn() -> str:
             "Set DATABASE_URL, SUPABASE_DB_URL (recommended for Supabase), or other DSN "
             "environment variables documented in database.config."
         )
-    return dsn
+    return _strip_dsn_decorative_quotes(dsn.strip())
 
 
 def get_postgres_conn(*, silent_probe: bool = False) -> psycopg.Connection:
@@ -328,13 +347,15 @@ def get_postgres_conn(*, silent_probe: bool = False) -> psycopg.Connection:
     global _first_postgres_connection_log_done
     raw_dsn = _require_postgres_dsn()
     dsn, sslmode_label = _ensure_postgres_dsn_sslmode_require(raw_dsn)
+    timeout_sec = _postgres_connect_timeout_sec()
     _logger.debug(
-        "PostgreSQL connect params: sslmode=%s connect_timeout=5 keepalives=1 prepare_threshold=0",
+        "PostgreSQL connect params: sslmode=%s connect_timeout=%s keepalives=1 prepare_threshold=0",
         sslmode_label,
+        timeout_sec,
     )
     connect_kw: dict[str, Any] = {
         "autocommit": True,
-        "connect_timeout": 5,
+        "connect_timeout": timeout_sec,
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
