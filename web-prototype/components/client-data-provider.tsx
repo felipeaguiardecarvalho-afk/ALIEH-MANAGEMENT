@@ -13,6 +13,7 @@ export function ClientDataProvider({ children }: { children: React.ReactNode }) 
   const prefetchSaleBatchCluster = useClientDataStore((s) => s.prefetchSaleBatchCluster);
 
   useEffect(() => {
+    if (!pathname.startsWith("/sales")) return;
     void (async () => {
       await ensureGlobalBundle();
       const skus = useClientDataStore.getState().saleableSkus.data;

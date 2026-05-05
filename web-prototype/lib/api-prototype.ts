@@ -19,6 +19,30 @@ const IS_PRODUCTION_TIER = (process.env.VERCEL_ENV || "").trim().toLowerCase() =
 const READ_TIMEOUT_MS = IS_PRODUCTION_TIER ? 25000 : 12000;
 const WRITE_TIMEOUT_MS = IS_PRODUCTION_TIER ? 30000 : 15000;
 
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+async function fetchReadWithRetry(url: string, init: RequestInit, retries = 2): Promise<Response> {
+  let attempt = 0;
+  let lastError: unknown = null;
+  while (attempt <= retries) {
+    try {
+      const res = await prototypeUndiciFetch(url, init);
+      if (!RETRYABLE_STATUS.has(res.status) || attempt === retries) {
+        return res;
+      }
+      // Drain body before retry to avoid leaking streams.
+      await res.arrayBuffer().catch(() => undefined);
+    } catch (err) {
+      lastError = err;
+      if (attempt === retries) throw err;
+    }
+    const backoffMs = 250 * (attempt + 1);
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    attempt += 1;
+  }
+  throw (lastError instanceof Error ? lastError : new Error("API read retry exhausted"));
+}
+
 /** Evita API_PROTOTYPE_URL=http://127.0.0.1:3000 (mesmo host/porta do Next) → 404 "Not Found" em /sales/... */
 function assertPrototypeApiNotSamePortAsNext(base: string): void {
   let parsed: URL;
@@ -199,7 +223,7 @@ export async function apiPrototypeFetchRead(
   const method = String(rest.method || (json !== undefined ? "POST" : "GET")).toUpperCase();
   const isGet = method === "GET";
   // Node/undici reuses keep-alive connections to the same API host by default.
-  return prototypeUndiciFetch(url, {
+  const requestInit: RequestInit = {
     ...rest,
     method,
     next: isGet
@@ -209,7 +233,8 @@ export async function apiPrototypeFetchRead(
     signal: rest.signal ?? AbortSignal.timeout(isGet ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS),
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
-  });
+  };
+  return isGet ? fetchReadWithRetry(url, requestInit, IS_PRODUCTION_TIER ? 2 : 1) : prototypeUndiciFetch(url, requestInit);
 }
 
 export async function apiPrototypeFetch(
