@@ -10,6 +10,10 @@ function attachInternalPrototypeSecret(headers: Headers): void {
 }
 
 export type GateFail = { ok: false; message: string };
+type PrototypeFetchInit = RequestInit & {
+  json?: unknown;
+  next?: { revalidate?: number; tags?: string[] };
+};
 
 /** Evita API_PROTOTYPE_URL=http://127.0.0.1:3000 (mesmo host/porta do Next) → 404 "Not Found" em /sales/... */
 function assertPrototypeApiNotSamePortAsNext(base: string): void {
@@ -176,9 +180,9 @@ export async function prototypeAuthHeadersRead(): Promise<Headers> {
 
 export async function apiPrototypeFetchRead(
   path: string,
-  init: RequestInit & { json?: unknown } = {}
+  init: PrototypeFetchInit = {}
 ): Promise<Response> {
-  const { json, headers: extra, ...rest } = init;
+  const { json, headers: extra, next, ...rest } = init;
   const url = `${getPrototypeApiBase()}${path.startsWith("/") ? path : `/${path}`}`;
   const headers = await prototypeAuthHeadersRead();
   if (extra) {
@@ -188,9 +192,17 @@ export async function apiPrototypeFetchRead(
     headers.set("Content-Type", "application/json");
   }
   attachInternalPrototypeSecret(headers);
+  const method = String(rest.method || (json !== undefined ? "POST" : "GET")).toUpperCase();
+  const isGet = method === "GET";
   // Node/undici reuses keep-alive connections to the same API host by default.
   return prototypeUndiciFetch(url, {
     ...rest,
+    method,
+    next: isGet
+      ? { ...(next || {}), revalidate: next?.revalidate ?? 30 }
+      : next,
+    cache: isGet ? (rest.cache ?? "force-cache") : (rest.cache ?? "no-store"),
+    signal: rest.signal ?? AbortSignal.timeout(isGet ? 8000 : 12000),
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });
@@ -198,9 +210,9 @@ export async function apiPrototypeFetchRead(
 
 export async function apiPrototypeFetch(
   path: string,
-  init: RequestInit & { json?: unknown } = {}
+  init: PrototypeFetchInit = {}
 ): Promise<Response> {
-  const { json, headers: extra, ...rest } = init;
+  const { json, headers: extra, next, ...rest } = init;
   const url = `${getPrototypeApiBase()}${path.startsWith("/") ? path : `/${path}`}`;
   const headers = await prototypeAuthHeaders();
   if (extra) {
@@ -210,9 +222,14 @@ export async function apiPrototypeFetch(
     headers.set("Content-Type", "application/json");
   }
   attachInternalPrototypeSecret(headers);
+  const method = String(rest.method || (json !== undefined ? "POST" : "GET")).toUpperCase();
   // Node/undici reuses keep-alive connections to the same API host by default.
   return prototypeUndiciFetch(url, {
     ...rest,
+    method,
+    next,
+    cache: rest.cache ?? "no-store",
+    signal: rest.signal ?? AbortSignal.timeout(12000),
     headers,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   });

@@ -3,16 +3,18 @@ import { PROTOTYPE_OPEN_ENV } from "@/lib/auth/constants";
 export type AliehEnv = "development" | "staging" | "production";
 
 /**
- * Canonical deployment tier. Prefer explicit `ALIEH_ENV`; otherwise infer from Vercel / Node.
+ * Canonical deployment tier.
+ * Safety first: when running on Vercel production, always treat as production.
  */
 export function getAliehEnv(): AliehEnv {
+  const vercel = (process.env.VERCEL_ENV || "").trim().toLowerCase();
+  if (vercel === "production") return "production";
+
   const explicit = (process.env.ALIEH_ENV || "").trim().toLowerCase();
   if (explicit === "production" || explicit === "prod") return "production";
   if (explicit === "staging" || explicit === "stg") return "staging";
   if (explicit === "development" || explicit === "dev") return "development";
 
-  const vercel = (process.env.VERCEL_ENV || "").trim().toLowerCase();
-  if (vercel === "production") return "production";
   if (vercel === "preview") return "staging";
 
   if (process.env.NODE_ENV === "production") return "production";
@@ -28,19 +30,11 @@ export function isStagingTier(): boolean {
 }
 
 /**
- * Modo aberto (sem login) só em desenvolvimento/staging — nunca em produção, mesmo se a env estiver errada.
- * Em `next dev`, se `AUTH_SESSION_SECRET` estiver vazio, equivale a modo aberto (só tier development).
+ * Modo aberto (sem login) só em desenvolvimento/staging — nunca em produção.
  */
 export function isPrototypeOpenEffective(): boolean {
   if (isProductionTier()) return false;
-  if (process.env[PROTOTYPE_OPEN_ENV] === "1") return true;
-  if (
-    getAliehEnv() === "development" &&
-    !(process.env.AUTH_SESSION_SECRET || "").trim()
-  ) {
-    return true;
-  }
-  return false;
+  return process.env[PROTOTYPE_OPEN_ENV] === "1";
 }
 
 function requireNonEmpty(name: string, value: string | undefined, context: string): void {
