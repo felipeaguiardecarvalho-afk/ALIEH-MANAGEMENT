@@ -38,6 +38,9 @@
   "exclude": [
     "node_modules",
     ".claude",
-    "web-prototype"
+    "web-prototype",
+    "backups",
+    "api-prototype",
+    "tests"
   ]
 }
