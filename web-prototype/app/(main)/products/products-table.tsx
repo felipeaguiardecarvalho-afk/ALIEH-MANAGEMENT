@@ -10,17 +10,17 @@ import type { ProductListRow } from "@/lib/products-api";
 import { mergeProductCatalogQuery, type ProductCatalogQuery } from "@/lib/products-url";
 
 const ALL_COLS = [
-  { key: "id", label: "ID", default: true },
+  { key: "id", label: "ID", default: true, locked: false },
   { key: "sku", label: "SKU", default: true, locked: true },
   { key: "name", label: "Nome", default: true, locked: true },
-  { key: "frame_color", label: "Armação", default: true },
-  { key: "lens_color", label: "Lente", default: true },
-  { key: "gender", label: "Gênero", default: false },
-  { key: "palette", label: "Paleta", default: false },
-  { key: "style", label: "Estilo", default: true },
-  { key: "created_at", label: "Criado", default: false },
+  { key: "frame_color", label: "Armação", default: true, locked: false },
+  { key: "lens_color", label: "Lente", default: true, locked: false },
+  { key: "gender", label: "Gênero", default: false, locked: false },
+  { key: "palette", label: "Paleta", default: false, locked: false },
+  { key: "style", label: "Estilo", default: true, locked: false },
+  { key: "created_at", label: "Criado", default: false, locked: false },
   { key: "stock", label: "Estoque", default: true, locked: true },
-  { key: "avg_cost", label: "Custo", default: true },
+  { key: "avg_cost", label: "Custo", default: true, locked: false },
   { key: "sell_price", label: "Preço", default: true, locked: true },
 ] as const;
 
@@ -94,7 +94,7 @@ export function ProductsTable({
               <div className="absolute right-0 top-[calc(100%+6px)] z-40 w-56 rounded-xl border border-border/70 bg-background p-1.5 shadow-2xl animate-in fade-in slide-in-from-top-1 duration-150">
                 {ALL_COLS.map((c) => {
                   const on = isVisible(c.key);
-                  const locked = "locked" in c && !!c.locked;
+                  const locked = c.locked;
                   return (
                     <button
                       key={c.key}
